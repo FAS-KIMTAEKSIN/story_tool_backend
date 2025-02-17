@@ -1,0 +1,408 @@
+from flask import Blueprint, request, jsonify
+from app.services.story_service import StoryService
+from app.services.search_service import SearchService
+from app.services.analysis_service import AnalysisService
+from app.utils.decorators import log_request_response
+from app.utils.database import Database
+from mysql.connector import Error
+from concurrent.futures import ThreadPoolExecutor
+import json
+from app.services.evaluation_service import EvaluationService
+
+api_bp = Blueprint('api', __name__)
+
+@api_bp.route('/search', methods=['POST'])
+@log_request_response
+def search_documents():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        results = SearchService.search_documents(data)
+        
+        # 응답 형식을 similar_1, 2, 3 키를 가진 객체로 변환
+        return jsonify({
+            "success": True,
+            "result": {
+                "similar_1": results[0] if len(results) > 0 else "",
+                "similar_2": results[1] if len(results) > 1 else "",
+                "similar_3": results[2] if len(results) > 2 else ""
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@api_bp.route('/generate', methods=['POST'])
+@log_request_response
+def generate_story():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        # 스토리 생성
+        generated_result = StoryService.generate_story(data)
+        
+        # 응답 형식을 DB ENUM과 일치하도록 변환
+        result = {
+            "user_input": data.get('user_input', ''),
+            "tags": data.get('tags', {}),
+            "created_title": generated_result.get('created_title', ''),
+            "created_content": generated_result.get('created_content', ''),
+            "similar_1": "",  # 프론트에서 /search 결과로 채워질 예정
+            "similar_2": "",  # 프론트에서 /search 결과로 채워질 예정
+            "similar_3": "",  # 프론트에서 /search 결과로 채워질 예정
+            "recommended_1": generated_result.get('recommendations', [''])[0],
+            "recommended_2": generated_result.get('recommendations', ['', ''])[1],
+            "recommended_3": generated_result.get('recommendations', ['', '', ''])[2]
+        }
+        
+        return jsonify({
+            "success": True,
+            "result": result
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@api_bp.route('/analyze', methods=['POST'])
+@log_request_response
+def analyze_work():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        result = AnalysisService.analyze_work(data)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@api_bp.route('/saveChatHistory', methods=['POST'])
+@log_request_response
+def save_chat_history():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        # 임시 사용자 ID 가져오기
+        user_id = Database.get_or_create_temp_user()
+        if user_id is None:
+            return jsonify({"error": "Failed to handle user"}), 500
+            
+        # 데이터 형식을 DB ENUM과 일치하도록 변환
+        formatted_data = {
+            "user_input": data.get('user_input', ''),
+            "tags": data.get('tags', {}),
+            "created_title": data.get('created_title', ''),
+            "created_content": data.get('created_content', ''),
+            "similar_1": data.get('similar_1', {}),
+            "similar_2": data.get('similar_2', {}),
+            "similar_3": data.get('similar_3', {}),
+            "recommended_1": data.get('recommended_1', ''),
+            "recommended_2": data.get('recommended_2', ''),
+            "recommended_3": data.get('recommended_3', '')
+        }
+            
+        conversation_id = StoryService.save_to_database(user_id, data, formatted_data)
+        
+        if conversation_id is None:
+            return jsonify({"error": "Failed to save to database"}), 500
+            
+        return jsonify({
+            "success": True,
+            "conversation_id": conversation_id,
+            "user_id": user_id
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@api_bp.route('/retrieveChatHistoryList', methods=['GET'])
+@log_request_response
+def retrieve_chat_history_list():
+    try:
+        # 임시 사용자 ID 가져오기 (나중에 실제 사용자 인증 구현 시 수정)
+        user_id = Database.get_or_create_temp_user()
+        if user_id is None:
+            return jsonify({"error": "Failed to handle user"}), 500
+            
+        connection = Database.get_connection()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+            
+        try:
+            cursor = connection.cursor(dictionary=True)
+            
+            # threads와 conversations, conversation_data를 조인하여 필요한 정보 조회
+            cursor.execute("""
+                SELECT 
+                    t.thread_id,
+                    t.created_at,
+                    t.updated_at,
+                    MAX(CASE WHEN cd.category = 'user_input' THEN cd.data END) as user_input,
+                    MAX(CASE WHEN cd.category = 'created_title' THEN cd.data END) as created_title,
+                    MAX(CASE WHEN cd.category = 'created_content' THEN LEFT(cd.data, 100) END) as preview_content
+                FROM threads t
+                LEFT JOIN conversations c ON t.thread_id = c.thread_id
+                LEFT JOIN conversation_data cd ON c.conversation_id = cd.conversation_id 
+                    AND c.thread_id = cd.thread_id
+                WHERE t.user_id = %s
+                GROUP BY t.thread_id, t.created_at, t.updated_at
+                ORDER BY t.updated_at DESC
+            """, (user_id,))
+            
+            results = cursor.fetchall()
+            
+            # datetime 객체를 문자열로 변환
+            for result in results:
+                result['created_at'] = result['created_at'].isoformat() if result['created_at'] else None
+                result['updated_at'] = result['updated_at'].isoformat() if result['updated_at'] else None
+            
+            return jsonify({
+                "success": True,
+                "result": results
+            })
+            
+        except Error as e:
+            print(f"Database error: {str(e)}")
+            return jsonify({"error": f"Database error: {str(e)}"}), 500
+            
+        finally:
+            if connection.is_connected():
+                cursor.close()
+                connection.close()
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@api_bp.route('/generateWithSearch', methods=['POST'])
+@log_request_response
+def generate_with_search():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        # 동시에 search와 generate 실행
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            search_future = executor.submit(SearchService.search_documents, data)
+            generate_future = executor.submit(StoryService.generate_story, data)
+            
+            # 두 결과 모두 기다림
+            search_results = search_future.result()
+            generated_result = generate_future.result()
+        
+        # 결과 병합
+        result = {
+            "user_input": data.get('user_input', ''),
+            "tags": data.get('tags', {}),
+            "created_title": generated_result.get('created_title', ''),
+            "created_content": generated_result.get('created_content', ''),
+            "similar_1": search_results[0] if len(search_results) > 0 else {},
+            "similar_2": search_results[1] if len(search_results) > 1 else {},
+            "similar_3": search_results[2] if len(search_results) > 2 else {},
+            "recommended_1": generated_result.get('recommendations', [''])[0],
+            "recommended_2": generated_result.get('recommendations', ['', ''])[1],
+            "recommended_3": generated_result.get('recommendations', ['', '', ''])[2]
+        }
+        
+        # 임시 사용자 ID 가져오기
+        user_id = Database.get_or_create_temp_user()
+        if user_id is None:
+            return jsonify({
+                "error": "Failed to handle user",
+                "result": result
+            }), 500
+            
+        # DB에 저장
+        thread_id, conversation_id = StoryService.save_to_database(user_id, data, result)
+        if thread_id is None or conversation_id is None:
+            return jsonify({
+                "error": "Failed to save to database",
+                "result": result
+            }), 500
+            
+        return jsonify({
+            "success": True,
+            "result": result,
+            "thread_id": thread_id,
+            "conversation_id": conversation_id,
+            "user_id": user_id
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@api_bp.route('/retrieveChatHistoryDetail', methods=['POST'])
+@log_request_response
+def retrieve_chat_history_detail():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
+        user_id = data.get('user_id')
+        thread_id = data.get('thread_id')
+        
+        if not user_id or not thread_id:
+            return jsonify({"error": "Missing required parameters"}), 400
+            
+        connection = Database.get_connection()
+        if not connection:
+            return jsonify({"error": "Database connection failed"}), 500
+            
+        try:
+            cursor = connection.cursor(dictionary=True)
+            
+            # 유효성 검사: thread가 존재하고 해당 user의 것인지 확인
+            cursor.execute("""
+                SELECT 1 FROM threads t
+                JOIN users u ON t.user_id = u.user_id
+                WHERE t.thread_id = %s AND u.user_id = %s
+            """, (thread_id, user_id))
+            
+            if not cursor.fetchone():
+                return jsonify({"error": "Invalid thread_id or user_id"}), 404
+            
+            # conversation_data 조회 쿼리 수정
+            cursor.execute("""
+                SELECT 
+                    c.conversation_id,
+                    cd.category,
+                    cd.data,
+                    ce.evaluation
+                FROM conversations c
+                JOIN conversation_data cd 
+                    ON c.thread_id = cd.thread_id 
+                    AND c.conversation_id = cd.conversation_id
+                JOIN threads t ON c.thread_id = t.thread_id
+                LEFT JOIN content_evaluation ce 
+                    ON c.thread_id = ce.thread_id 
+                    AND c.conversation_id = ce.conversation_id 
+                    AND ce.user_id = %s
+                WHERE c.thread_id = %s
+                ORDER BY c.conversation_id ASC, cd.category
+            """, (user_id, thread_id))
+            
+            rows = cursor.fetchall()
+            
+            if not rows:
+                return jsonify({"error": "No conversations found"}), 404
+            
+            # 데이터 구조화 부분 수정
+            conversations = {}
+            for row in rows:
+                conv_id = row['conversation_id']
+                if conv_id not in conversations:
+                    conversations[conv_id] = {
+                        'conversation_id': conv_id,
+                        'user_input': '',
+                        'tags': {},
+                        'created_title': '',
+                        'created_content': '',
+                        'similar_1': {},
+                        'similar_2': {},
+                        'similar_3': {},
+                        'recommended_1': '',
+                        'recommended_2': '',
+                        'recommended_3': '',
+                        'evaluation': row['evaluation']
+                    }
+                
+                category = row['category']
+                data = row['data']
+                
+                # JSON 데이터 파싱
+                if category in ['tags', 'similar_1', 'similar_2', 'similar_3']:
+                    conversations[conv_id][category] = json.loads(data) if data else {}
+                else:
+                    conversations[conv_id][category] = data
+            
+            # 리스트로 변환하고 정렬
+            conversation_list = list(conversations.values())
+            
+            # generateWithSearch와 동일한 형식으로 응답
+            return jsonify({
+                "success": True,
+                "conversation_history": [
+                    {
+                        "success": True,
+                        "result": conv,
+                        "thread_id": thread_id,
+                        "conversation_id": conv['conversation_id'],
+                        "user_id": user_id
+                    } for conv in conversation_list
+                ]
+            })
+            
+        except Error as e:
+            print(f"Database error: {str(e)}")
+            return jsonify({"error": f"Database error: {str(e)}"}), 500
+            
+        finally:
+            if connection.is_connected():
+                cursor.close()
+                connection.close()
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@api_bp.route('/updateEvaluation', methods=['POST'])
+@log_request_response
+def update_evaluation():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "데이터가 제공되지 않았습니다"}), 400
+            
+        required_fields = ['thread_id', 'conversation_id', 'user_id', 'evaluation']
+        if not all(field in data for field in required_fields):
+            return jsonify({"error": "필수 필드가 누락되었습니다"}), 400
+            
+        # evaluation 값 검증
+        if data['evaluation'] not in ['like', 'dislike']:
+            return jsonify({"error": "잘못된 evaluation 값입니다"}), 400
+            
+        result = EvaluationService.update_content_evaluation(
+            thread_id=data['thread_id'],
+            conversation_id=data['conversation_id'],
+            user_id=data['user_id'],
+            evaluation=data['evaluation']
+        )
+        
+        if result['success']:
+            return jsonify(result)
+        else:
+            return jsonify({"error": result['error']}), 500
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@api_bp.route('/getEvaluation', methods=['POST'])
+@log_request_response
+def get_evaluation():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "데이터가 제공되지 않았습니다"}), 400
+            
+        required_fields = ['thread_id', 'conversation_id', 'user_id']
+        if not all(field in data for field in required_fields):
+            return jsonify({"error": "필수 필드가 누락되었습니다"}), 400
+            
+        result = EvaluationService.get_content_evaluation(
+            thread_id=data['thread_id'],
+            conversation_id=data['conversation_id'],
+            user_id=data['user_id']
+        )
+        
+        if result['success']:
+            return jsonify(result)
+        else:
+            return jsonify({"error": result['error']}), 500
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

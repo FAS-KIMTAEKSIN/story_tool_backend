@@ -14,7 +14,7 @@ class StoryService:
         completion = cls.client.chat.completions.create(
             model=Config.FINE_TUNED_MODEL,
             messages=[
-                {"role": "system", "content": "당신은 다양한 장르의 전문 작가입니다. 제시된 라벨링 기준을 참고하여 한 단락의 이야기를 생성해 주세요.\n\n- 주어진 내용분류, 주제어, 주제문은 생성될 단락의 라벨링입니다.\n- 장르와 배경에 맞는 적절한 문체와 표현을 사용해주세요.\n- 인물의 행동, 대화, 감정을 자연스럽게 표현해주세요.\n- 한 단락 안에서 상황과 인물 관계를 효과적으로 담아주세요."},
+                {"role": "system", "content": "당신은 다양한 장르의 전문 작가입니다. 제시된 라벨링 기준을 참고하여 이야기를 생성해 주세요.\n\n- 주어진 내용분류, 주제어, 주제문은 생성될 단락의 라벨링입니다.\n- 장르와 배경에 맞는 적절한 문체와 표현을 사용해주세요.\n- 인물의 행동, 대화, 감정을 자연스럽게 표현해주세요.\n- 상황과 인물 관계를 효과적으로 담아주세요."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
@@ -84,13 +84,19 @@ class StoryService:
                     # 정수로 변환 실패하면 새로 생성
                     thread_id = None
             
-            if not thread_id:  # None, 빈 문자열, 0, 유효하지 않은 ID
-                # 새 thread 생성
+            if not thread_id:  # 새 thread 생성
+                # 첫 번째 conversation의 제목을 thread title로 설정
                 cursor.execute(
-                    "INSERT INTO threads (user_id) VALUES (%s)",
-                    (user_id,)
+                    "INSERT INTO threads (user_id, title) VALUES (%s, %s)",
+                    (user_id, formatted_data.get('created_title', ''))
                 )
                 thread_id = cursor.lastrowid
+            else:
+                # 기존 thread의 updated_at 업데이트
+                cursor.execute(
+                    "UPDATE threads SET updated_at = CURRENT_TIMESTAMP WHERE thread_id = %s",
+                    (thread_id,)
+                )
             
             # 해당 thread의 마지막 conversation_id 조회
             cursor.execute(

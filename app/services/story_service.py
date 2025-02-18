@@ -4,23 +4,89 @@ from app.config import Config
 from app.utils.database import Database
 import json
 from mysql.connector import Error
+import requests
+from app.utils.helpers import generate_session_hash
+import traceback
 
 class StoryService:
     client = OpenAI()
 
     @classmethod
     def generate_content(cls, prompt):
-        """본문 생성"""
-        completion = cls.client.chat.completions.create(
-            model=Config.FINE_TUNED_MODEL,
-            messages=[
-                {"role": "system", "content": "당신은 다양한 장르의 전문 작가입니다. 제시된 라벨링 기준을 참고하여 이야기를 생성해 주세요.\n\n- 주어진 내용분류, 주제어, 주제문은 생성될 단락의 라벨링입니다.\n- 장르와 배경에 맞는 적절한 문체와 표현을 사용해주세요.\n- 인물의 행동, 대화, 감정을 자연스럽게 표현해주세요.\n- 상황과 인물 관계를 효과적으로 담아주세요."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=1024
-        )
-        return completion.choices[0].message.content
+        """
+        VAIV API를 사용하여 이야기를 생성하고 스트림으로 반환합니다.
+        """
+        print(f"[DEBUG] Starting generation with prompt: {prompt}")
+        session_hash = generate_session_hash()
+        print(f"[DEBUG] Generated session hash: {session_hash}")
+        
+        # 첫 번째 API 요청 - 큐 참여
+        join_url = 'https://story.vaiv.kr/gradio_api/queue/join'
+        headers = {
+            'Accept': '*/*',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Connection': 'keep-alive',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            "data": [prompt],
+            "event_data": None,
+            "fn_index": 0,
+            "trigger_id": 4,
+            "session_hash": session_hash
+        }
+        
+        print(f"[DEBUG] Sending join request with payload: {payload}")
+        response = requests.post(join_url, headers=headers, json=payload)
+        print(f"[DEBUG] Join response status: {response.status_code}")
+        print(f"[DEBUG] Join response content: {response.text}")
+        
+        if response.status_code != 200:
+            raise Exception("API 요청 실패")
+        
+        # 두 번째 API 요청 - 데이터 가져오기
+        data_url = f'https://story.vaiv.kr/gradio_api/queue/data?session_hash={session_hash}'
+        headers = {
+            'Accept': 'text/event-stream',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Connection': 'keep-alive'
+        }
+        
+        print(f"[DEBUG] Starting stream request to: {data_url}")
+        with requests.get(data_url, headers=headers, stream=True) as response:
+            print(f"[DEBUG] Stream response status: {response.status_code}")
+            
+            if response.status_code != 200:
+                raise Exception("데이터 가져오기 실패")
+            
+            for line in response.iter_lines():
+                if line:
+                    decoded_line = line.decode('utf-8')
+                    print(f"[DEBUG] Received line: {decoded_line}")
+                    
+                    if decoded_line.startswith('data: '):
+                        try:
+                            data = json.loads(decoded_line[6:])
+                            print(f"[DEBUG] Parsed data: {data}")
+                            
+                            if isinstance(data, dict):
+                                if data.get('msg') == 'process_completed':
+                                    print("[DEBUG] Process completed")
+                                    break
+                                    
+                                if data.get('output') and data['output'].get('data'):
+                                    content = data['output']['data'][0]
+                                    is_generating = data['output'].get('is_generating', True)
+                                    print(f"[DEBUG] Content: {content}, is_generating: {is_generating}")
+                                    
+                                    if content and not is_generating:
+                                        print(f"[DEBUG] Yielding content: {content}")
+                                        yield content
+                                        
+                        except json.JSONDecodeError as e:
+                            print(f"[DEBUG] JSON decode error: {e}")
+                            continue
 
     @classmethod
     def generate_title(cls, content):
@@ -155,24 +221,86 @@ class StoryService:
 
     @classmethod
     def generate_story(cls, data):
-        """스토리 생성"""
-        from app.services.search_service import SearchService
+        try:
+            from app.services.search_service import SearchService
+            
+            # 1. 프롬프트 생성
+            prompt = SearchService.process_input(data)
+            
+            # 2. 이야기 생성
+            url = Config.VAIV_QUEUE_JOIN_URL
+            headers = {
+                'Accept': '*/*',
+                'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Connection': 'keep-alive',
+                'Content-Type': 'application/json'
+            }
+            
+            session_hash = generate_session_hash()
+            payload = {
+                "data": [prompt],
+                "event_data": None,
+                "fn_index": 0,
+                "trigger_id": 4,
+                "session_hash": session_hash
+            }
+            
+            # 큐 참여
+            response = requests.post(url, headers=headers, json=payload)
+            if response.status_code != 200:
+                raise Exception(f"큐 참여 실패: {response.text}")
+            
+            # 데이터 가져오기
+            data_url = f'{Config.VAIV_QUEUE_DATA_URL}?session_hash={session_hash}'
+            headers = {
+                'Accept': 'text/event-stream',
+                'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Connection': 'keep-alive'
+            }
+            
+            content = None
+            with requests.get(data_url, headers=headers, stream=True) as response:
+                if response.status_code != 200:
+                    raise Exception(f"데이터 가져오기 실패: {response.text}")
+                
+                for line in response.iter_lines():
+                    if line:
+                        decoded_line = line.decode('utf-8')
+                        if decoded_line.startswith('data: '):
+                            try:
+                                data = json.loads(decoded_line[6:])
+                                # 그라디오 응답을 그대로 전달
+                                yield decoded_line[6:]  # 'data: ' 제외하고 전달
+                                
+                                # process_completed 메시지에서 최종 컨텐츠 저장
+                                if data.get('msg') == 'process_completed':
+                                    if data.get('output') and data['output'].get('data'):
+                                        content = data['output']['data'][0]
+                                        break
+                                            
+                            except json.JSONDecodeError:
+                                continue
+            
+            if not content:
+                raise Exception("이야기 생성 실패: 컨텐츠가 비어있음")
 
-        prompt = SearchService.process_input(data)
-        created_content = cls.generate_content(prompt)
-
-        with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
-            title_future = executor.submit(cls.generate_title, created_content)
-            recommendation_futures = [
-                executor.submit(cls.generate_recommendation, data.get('user_input', ''))
+            # 3. 제목 생성
+            title = cls.generate_title(content)
+            
+            # 4. 추천 이야기 생성
+            recommendations = [
+                cls.generate_recommendation(data.get('user_input', ''))
                 for _ in range(3)
             ]
-
-            created_title = title_future.result()
-            recommendations = [f.result() for f in recommendation_futures]
-
-        return {
-            "created_title": created_title,
-            "created_content": created_content,
-            "recommendations": recommendations
-        }
+            
+            # 최종 결과를 딕셔너리로 yield
+            yield {
+                "created_title": title,
+                "created_content": content,
+                "recommendations": recommendations
+            }
+            
+        except Exception as e:
+            print(f"[DEBUG] ERROR in generate_story: {str(e)}")
+            print(f"[DEBUG] ERROR traceback: {traceback.format_exc()}")
+            raise e

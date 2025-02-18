@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response, stream_with_context
 from app.services.story_service import StoryService
 from app.services.search_service import SearchService
 from app.services.analysis_service import AnalysisService
@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from app.services.history_service import HistoryService
 from app.services.evaluation_service import EvaluationService
+import traceback
 
 api_bp = Blueprint('api', __name__)
 
@@ -148,55 +149,84 @@ def retrieve_chat_history_list():
 def generate_with_search():
     try:
         data = request.json
+        print(f"[DEBUG] Received request data: {data}")
+        
         if not data:
             return jsonify({"error": "No data provided"}), 400
             
-        # 동시에 search와 generate 실행
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            search_future = executor.submit(SearchService.search_documents, data)
-            generate_future = executor.submit(StoryService.generate_story, data)
-            
-            # 두 결과 모두 기다림
-            search_results = search_future.result()
-            generated_result = generate_future.result()
-        
-        # 결과 병합
-        result = {
-            "user_input": data.get('user_input', ''),
-            "tags": data.get('tags', {}),
-            "created_title": generated_result.get('created_title', ''),
-            "created_content": generated_result.get('created_content', ''),
-            "similar_1": search_results[0] if len(search_results) > 0 else {},
-            "similar_2": search_results[1] if len(search_results) > 1 else {},
-            "similar_3": search_results[2] if len(search_results) > 2 else {},
-            "recommended_1": generated_result.get('recommendations', [''])[0],
-            "recommended_2": generated_result.get('recommendations', ['', ''])[1],
-            "recommended_3": generated_result.get('recommendations', ['', '', ''])[2]
-        }
-        
-        # 임시 사용자 ID 가져오기
-        user_id = Database.get_or_create_temp_user()
-        if user_id is None:
-            return jsonify({
-                "error": "Failed to handle user",
-                "result": result
-            }), 500
-            
-        # DB에 저장
-        thread_id, conversation_id = StoryService.save_to_database(user_id, data, result)
-        if thread_id is None or conversation_id is None:
-            return jsonify({
-                "error": "Failed to save to database",
-                "result": result
-            }), 500
-            
-        return jsonify({
-            "success": True,
-            "result": result,
-            "thread_id": thread_id,
-            "conversation_id": conversation_id,
-            "user_id": user_id
-        })
+        def generate():
+            try:
+                # 스트림 시작을 알림
+                yield "data: {\"status\": \"generating\"}\n\n"
+                
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    # 검색 시작
+                    search_future = executor.submit(SearchService.search_documents, data)
+                    
+                    # 이야기 생성 및 실시간 스트리밍
+                    story_generator = StoryService.generate_story(data)
+                    final_content = None
+                    
+                    # 생성되는 내용을 실시간으로 전송
+                    for content in story_generator:
+                        if isinstance(content, dict):  # 최종 결과인 경우
+                            generated_result = content
+                            final_content = content['created_content']
+                            break
+                        else:  # 생성 중인 컨텐츠인 경우
+                            final_content = content
+                            yield f"data: {json.dumps({'content': content})}\n\n"
+                    
+                    # 검색 결과 대기
+                    search_results = search_future.result()
+                
+                # 최종 결과 병합
+                result = {
+                    "user_input": data.get('user_input', ''),
+                    "tags": data.get('tags', {}),
+                    "created_title": generated_result['created_title'],
+                    "created_content": final_content,
+                    "similar_1": search_results[0] if len(search_results) > 0 else {},
+                    "similar_2": search_results[1] if len(search_results) > 1 else {},
+                    "similar_3": search_results[2] if len(search_results) > 2 else {},
+                    "recommended_1": generated_result['recommendations'][0],
+                    "recommended_2": generated_result['recommendations'][1],
+                    "recommended_3": generated_result['recommendations'][2]
+                }
+                
+                # 임시 사용자 ID 가져오기
+                user_id = Database.get_or_create_temp_user()
+                if user_id is None:
+                    raise Exception("Failed to handle user")
+                    
+                # DB에 저장
+                thread_id, conversation_id = StoryService.save_to_database(user_id, data, result)
+                if thread_id is None or conversation_id is None:
+                    raise Exception("Failed to save to database")
+                
+                # 최종 결과 전송
+                final_result = {
+                    "success": True,
+                    "result": result,
+                    "thread_id": thread_id,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id
+                }
+                yield f"data: {json.dumps(final_result)}\n\n"
+                
+            except Exception as e:
+                print(f"[DEBUG] Error in generate function: {str(e)}")
+                print(f"[DEBUG] Error traceback: {traceback.format_exc()}")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no'
+            }
+        )
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500

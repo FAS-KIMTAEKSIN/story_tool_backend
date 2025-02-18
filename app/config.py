@@ -37,3 +37,8 @@ class Config:
     DB_USER = os.getenv('DB_USER')
     DB_PASSWORD = os.getenv('DB_PASSWORD')
     DB_NAME = os.getenv('DB_NAME') 
+    
+    # VAIV API 설정
+    VAIV_API_BASE_URL = 'https://story.vaiv.kr/gradio_api'
+    VAIV_QUEUE_JOIN_URL = f'{VAIV_API_BASE_URL}/queue/join'
+    VAIV_QUEUE_DATA_URL = f'{VAIV_API_BASE_URL}/queue/data'

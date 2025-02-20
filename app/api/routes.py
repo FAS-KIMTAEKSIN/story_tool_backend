@@ -175,7 +175,7 @@ def generate_with_search():
                             break
                         else:  # 생성 중인 컨텐츠인 경우
                             final_content = content
-                            yield f"data: {json.dumps({'content': content})}\n\n"
+                            yield f",data: {json.dumps(content)}\n\n"
                     
                     # 검색 결과 대기
                     search_results = search_future.result()
@@ -186,12 +186,12 @@ def generate_with_search():
                     "tags": data.get('tags', {}),
                     "created_title": generated_result['created_title'],
                     "created_content": final_content,
-                    "similar_1": search_results[0] if len(search_results) > 0 else {},
-                    "similar_2": search_results[1] if len(search_results) > 1 else {},
-                    "similar_3": search_results[2] if len(search_results) > 2 else {},
-                    "recommended_1": generated_result['recommendations'][0],
-                    "recommended_2": generated_result['recommendations'][1],
-                    "recommended_3": generated_result['recommendations'][2]
+                    # "similar_1": search_results[0] if len(search_results) > 0 else {},
+                    # "similar_2": search_results[1] if len(search_results) > 1 else {},
+                    # "similar_3": search_results[2] if len(search_results) > 2 else {},
+                    # "recommended_1": generated_result['recommendations'][0],
+                    # "recommended_2": generated_result['recommendations'][1],
+                    # "recommended_3": generated_result['recommendations'][2]
                 }
                 
                 # 임시 사용자 ID 가져오기

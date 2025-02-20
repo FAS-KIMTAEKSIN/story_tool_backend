@@ -52,7 +52,7 @@ class SearchService:
 
         # 분류 정보가 있는 경우와 없는 경우를 구분하여 처리
         if classifications:
-            return f"""내용분류: {', '.join(classifications)}
+            return f"""내용분류: {", ".join(classifications)}
 주제어: {keywords}
 주제문: {theme}"""
         else:

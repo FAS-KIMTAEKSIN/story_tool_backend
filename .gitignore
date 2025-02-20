@@ -1,0 +1,13 @@
+asset-manifest.json
+.venv/
+app/static/
+app/templates/
+.codegpt
+__pycache__/
+*.pyc
+.env
+venv/
+.idea/
+.vscode/
+*.log
+app/index.html

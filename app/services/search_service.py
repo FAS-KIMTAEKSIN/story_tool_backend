@@ -177,3 +177,33 @@ class SearchService:
         except Exception as e:
             print(f"Error in search_documents: {str(e)}")
             raise 
+
+    @classmethod
+    def get_recommendations(cls, data):
+        """추천 문서 생성"""
+        from app.services.story_service import StoryService
+        
+        recommendations = [
+            StoryService.generate_recommendation(data.get('user_input', ''))
+            for _ in range(3)
+        ]
+        return recommendations
+
+    @classmethod
+    def search_and_recommend(cls, data):
+        """문서 검색 및 추천 수행"""
+        try:
+            # 문서 검색
+            search_results = cls.search_documents(data)
+            
+            # 추천 문서 생성
+            recommendations = cls.get_recommendations(data)
+            
+            return {
+                "search_results": search_results,
+                "recommendations": recommendations
+            }
+            
+        except Exception as e:
+            print(f"Error in search_and_recommend: {str(e)}")
+            raise 

@@ -19,17 +19,38 @@ def search_documents():
     try:
         data = request.json
         if not data:
-            return jsonify({"error": "No data provided"}), 400
+            return jsonify({"error": "데이터가 제공되지 않았습니다"}), 400
+
+        required_fields = ['user_input', 'tags', 'thread_id', 'conversation_id', 'user_id']
+        if not all(field in data for field in required_fields):
+            return jsonify({"error": "필수 필드가 누락되었습니다"}), 400
             
-        results = SearchService.search_documents(data)
+        # 검색 및 추천 수행
+        results = SearchService.search_and_recommend(data)
+        search_results = results['search_results']
+        recommendations = results['recommendations']
         
-        # 응답 형식을 similar_1, 2, 3 키를 가진 객체로 변환
+        # DB 업데이트
+        update_result = StoryService.update_search_results(
+            thread_id=data['thread_id'],
+            conversation_id=data['conversation_id'],
+            user_id=data['user_id'],
+            search_results=search_results,
+            recommendations=recommendations
+        )
+        
+        if not update_result['success']:
+            return jsonify({"error": "DB 업데이트 실패"}), 500
+        
         return jsonify({
             "success": True,
             "result": {
-                "similar_1": results[0] if len(results) > 0 else "",
-                "similar_2": results[1] if len(results) > 1 else "",
-                "similar_3": results[2] if len(results) > 2 else ""
+                "similar_1": search_results[0] if len(search_results) > 0 else {},
+                "similar_2": search_results[1] if len(search_results) > 1 else {},
+                "similar_3": search_results[2] if len(search_results) > 2 else {},
+                "recommended_1": recommendations[0] if len(recommendations) > 0 else "",
+                "recommended_2": recommendations[1] if len(recommendations) > 1 else "",
+                "recommended_3": recommendations[2] if len(recommendations) > 2 else ""
             }
         })
     except Exception as e:
@@ -41,29 +62,77 @@ def generate_story():
     try:
         data = request.json
         if not data:
-            return jsonify({"error": "No data provided"}), 400
-            
-        # 스토리 생성
-        generated_result = StoryService.generate_story(data)
-        
-        # 응답 형식을 DB ENUM과 일치하도록 변환
-        result = {
-            "user_input": data.get('user_input', ''),
-            "tags": data.get('tags', {}),
-            "created_title": generated_result.get('created_title', ''),
-            "created_content": generated_result.get('created_content', ''),
-            "similar_1": "",  # 프론트에서 /search 결과로 채워질 예정
-            "similar_2": "",  # 프론트에서 /search 결과로 채워질 예정
-            "similar_3": "",  # 프론트에서 /search 결과로 채워질 예정
-            "recommended_1": generated_result.get('recommendations', [''])[0],
-            "recommended_2": generated_result.get('recommendations', ['', ''])[1],
-            "recommended_3": generated_result.get('recommendations', ['', '', ''])[2]
-        }
-        
-        return jsonify({
-            "success": True,
-            "result": result
-        })
+            return jsonify({"error": "데이터가 제공되지 않았습니다"}), 400
+
+        def generate():
+            try:
+                # 스트림 시작을 알림
+                yield "data: {\"status\": \"generating\"}\n\n"
+                
+                # 이야기 생성 및 실시간 스트리밍
+                story_generator = StoryService.generate_story(data)
+                final_content = None
+                generated_result = None
+                
+                for content in story_generator:
+                    if isinstance(content, dict):  # 최종 결과인 경우
+                        generated_result = content
+                        final_content = content['created_content']
+                        break
+                    else:  # 생성 중인 컨텐츠인 경우
+                        final_content = content
+                        yield f"data: {json.dumps(content)}\n\n"
+                
+                if not generated_result or not final_content:
+                    raise Exception("이야기 생성 실패: 결과가 비어있음")
+                
+                # 결과 포맷팅
+                result = {
+                    "user_input": data.get('user_input', ''),
+                    "tags": data.get('tags', {}),
+                    "created_title": generated_result['created_title'],
+                    "created_content": final_content,
+                    "similar_1": {},
+                    "similar_2": {},
+                    "similar_3": {},
+                    "recommended_1": "",
+                    "recommended_2": "",
+                    "recommended_3": ""
+                }
+                
+                # 임시 사용자 ID 가져오기
+                user_id = Database.get_or_create_temp_user()
+                if user_id is None:
+                    raise Exception("Failed to handle user")
+                    
+                # DB에 저장
+                thread_id, conversation_id = StoryService.save_to_database(user_id, data, result)
+                if thread_id is None or conversation_id is None:
+                    raise Exception("Failed to save to database")
+                
+                # 최종 결과 전송
+                final_result = {
+                    "success": True,
+                    "result": result,
+                    "thread_id": thread_id,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id
+                }
+                yield f"data: {json.dumps(final_result)}\n\n"
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to generate story: {str(e)}")
+                print(f"[ERROR] {traceback.format_exc()}")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no'
+            }
+        )
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -175,7 +244,7 @@ def generate_with_search():
                             break
                         else:  # 생성 중인 컨텐츠인 경우
                             final_content = content
-                            yield f",data: {json.dumps(content)}\n\n"
+                            yield f"data: {json.dumps(content)}\n\n"
                     
                     # 검색 결과 대기
                     search_results = search_future.result()

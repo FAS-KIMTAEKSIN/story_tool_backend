@@ -127,6 +127,7 @@ class StoryService:
             return None, None
             
         try:
+            print(f"[INFO] Saving story to database for user_id: {user_id}")
             cursor = connection.cursor()
             
             # thread_id가 없거나 null이거나 빈 문자열이면 새 thread 생성
@@ -188,28 +189,34 @@ class StoryService:
                 ('tags', json.dumps(formatted_data.get('tags', {}), ensure_ascii=False)),
                 ('created_title', formatted_data.get('created_title', '')),
                 ('created_content', formatted_data.get('created_content', '')),
-                ('similar_1', json.dumps(formatted_data.get('similar_1', {}), ensure_ascii=False)),
-                ('similar_2', json.dumps(formatted_data.get('similar_2', {}), ensure_ascii=False)),
-                ('similar_3', json.dumps(formatted_data.get('similar_3', {}), ensure_ascii=False)),
-                ('recommended_1', formatted_data.get('recommended_1', '')),
-                ('recommended_2', formatted_data.get('recommended_2', '')),
-                ('recommended_3', formatted_data.get('recommended_3', ''))
+                ('similar_1', '{}'),
+                ('similar_2', '{}'),
+                ('similar_3', '{}'),
+                ('recommended_1', ''),
+                ('recommended_2', ''),
+                ('recommended_3', '')
             ]
             
             # 각 데이터 항목을 개별적으로 저장
             for category, value in data_entries:
-                cursor.execute(
-                    """INSERT INTO conversation_data 
-                       (conversation_id, thread_id, category, data) 
-                       VALUES (%s, %s, %s, %s)""",
-                    (conversation_id, thread_id, category, value)
-                )
+                try:
+                    cursor.execute(
+                        """INSERT INTO conversation_data 
+                           (conversation_id, thread_id, category, data) 
+                           VALUES (%s, %s, %s, %s)""",
+                        (conversation_id, thread_id, category, value)
+                    )
+                except Exception as e:
+                    print(f"[ERROR] Failed to insert {category}: {str(e)}")
+                    raise
             
             connection.commit()
+            print(f"[INFO] Successfully saved story. thread_id: {thread_id}, conversation_id: {conversation_id}")
             return thread_id, conversation_id
             
         except Exception as e:
-            print(f"Error saving to database: {str(e)}")
+            print(f"[ERROR] Failed to save to database: {str(e)}")
+            print(f"[ERROR] {traceback.format_exc()}")
             if connection:
                 connection.rollback()
             return None, None
@@ -221,54 +228,111 @@ class StoryService:
 
     @classmethod
     def generate_story(cls, data):
+        """이야기 생성 및 스트리밍"""
         try:
-            from app.services.search_service import SearchService
-            
-            # 1. 프롬프트 생성
-            prompt = SearchService.process_input(data)
-            
-            # 2. 이야기 생성
-            url = Config.VAIV_QUEUE_JOIN_URL
-            headers = {
-                'Accept': '*/*',
-                'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Connection': 'keep-alive',
-                'Content-Type': 'application/json'
-            }
-            
-            session_hash = generate_session_hash()
-            payload = {
-                "data": [prompt],
-                "event_data": None,
-                "fn_index": 0,
-                "trigger_id": 4,
-                "session_hash": session_hash
-            }
-            
-            # 큐 참여
-            response = requests.post(url, headers=headers, json=payload)
-            if response.status_code != 200:
-                raise Exception(f"큐 참여 실패: {response.text}")
-            
-            # 데이터 가져오기
-            data_url = f'{Config.VAIV_QUEUE_DATA_URL}?session_hash={session_hash}'
-            headers = {
-                'Accept': 'text/event-stream',
-                'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Connection': 'keep-alive'
-            }
-            
+            # 이야기 생성
             content = None
-            with requests.get(data_url, headers=headers, stream=True) as response:
-                if response.status_code != 200:
-                    raise Exception(f"데이터 가져오기 실패: {response.text}")
-                
-                for line in response.iter_lines():
-                    if line:
-                        decoded_line = line.decode('utf-8')
-                        if decoded_line.startswith('data: '):
-                            try:
-                                data = json.loads(decoded_line[6:])
+            generated_result = None
+            
+            for generated_content in cls._stream_story_generation(data):
+                try:
+                    # JSON 문자열인 경우 파싱
+                    if isinstance(generated_content, str):
+                        parsed_data = json.loads(generated_content)
+                        # 중간 생성 과정 전달
+                        yield generated_content
+                        
+                        # 최종 결과인 경우 저장
+                        if parsed_data.get('msg') == 'process_completed':
+                            if parsed_data.get('output') and parsed_data['output'].get('data'):
+                                content = parsed_data['output']['data'][0]
+                    # 최종 컨텐츠인 경우
+                    else:
+                        content = generated_content
+                except json.JSONDecodeError:
+                    continue
+            
+            if not content:
+                raise Exception("이야기 생성 실패: 컨텐츠가 비어있음")
+            
+            # 제목 생성
+            title = cls.generate_title(content)
+            
+            # 최종 결과를 딕셔너리로 yield
+            generated_result = {
+                "created_title": title,
+                "created_content": content
+            }
+            yield generated_result
+            
+        except Exception as e:
+            print(f"[DEBUG] ERROR in generate_story: {str(e)}")
+            print(f"[DEBUG] ERROR traceback: {traceback.format_exc()}")
+            raise e
+
+    @classmethod
+    def _stream_story_generation(cls, data):
+        """VAIV API를 사용한 이야기 생성 스트리밍"""
+        from app.services.search_service import SearchService
+        
+        # 프롬프트 생성
+        prompt = SearchService.process_input(data)
+        print(f"[DEBUG] Starting generation with prompt: {prompt}")
+        
+        # VAIV API 호출 및 스트리밍 처리
+        session_hash = generate_session_hash()
+        print(f"[DEBUG] Generated session hash: {session_hash}")
+        
+        # 첫 번째 API 요청 - 큐 참여
+        headers = {
+            'Accept': '*/*',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Connection': 'keep-alive',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            "data": [prompt],
+            "event_data": None,
+            "fn_index": 0,
+            "trigger_id": 4,
+            "session_hash": session_hash
+        }
+        
+        print(f"[DEBUG] Sending join request with payload: {payload}")
+        response = requests.post(Config.VAIV_QUEUE_JOIN_URL, headers=headers, json=payload)
+        print(f"[DEBUG] Join response status: {response.status_code}")
+        print(f"[DEBUG] Join response content: {response.text}")
+        
+        if response.status_code != 200:
+            raise Exception("API 요청 실패")
+        
+        # 두 번째 API 요청 - 데이터 가져오기
+        data_url = f'{Config.VAIV_QUEUE_DATA_URL}?session_hash={session_hash}'
+        headers = {
+            'Accept': 'text/event-stream',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Connection': 'keep-alive'
+        }
+        
+        print(f"[DEBUG] Starting stream request to: {data_url}")
+        with requests.get(data_url, headers=headers, stream=True) as response:
+            print(f"[DEBUG] Stream response status: {response.status_code}")
+            
+            if response.status_code != 200:
+                raise Exception("데이터 가져오기 실패")
+            
+            for line in response.iter_lines():
+                if line:
+                    decoded_line = line.decode('utf-8')
+                    print(f"[DEBUG] Received line: {decoded_line}")
+                    
+                    if decoded_line.startswith('data: '):
+                        try:
+                            data = json.loads(decoded_line[6:])
+                            print(f"[DEBUG] Parsed data: {data}")
+                            
+                            if isinstance(data, dict):
                                 # 그라디오 응답을 그대로 전달
                                 yield decoded_line[6:]  # 'data: ' 제외하고 전달
                                 
@@ -276,31 +340,71 @@ class StoryService:
                                 if data.get('msg') == 'process_completed':
                                     if data.get('output') and data['output'].get('data'):
                                         content = data['output']['data'][0]
-                                        break
-                                            
-                            except json.JSONDecodeError:
-                                continue
-            
-            if not content:
-                raise Exception("이야기 생성 실패: 컨텐츠가 비어있음")
+                                        if content:  # 컨텐츠가 있는 경우에만 yield
+                                            yield content
+                                    break
+                                    
+                        except json.JSONDecodeError as e:
+                            print(f"[DEBUG] JSON decode error: {e}")
+                            continue
 
-            # 3. 제목 생성
-            title = cls.generate_title(content)
+    @classmethod
+    def update_search_results(cls, thread_id: int, conversation_id: int, user_id: int, 
+                             search_results: list, recommendations: list) -> dict:
+        """검색 결과와 추천 문서를 DB에 업데이트"""
+        connection = Database.get_connection()
+        if not connection:
+            return {"success": False, "error": "Database connection failed"}
+        
+        try:
+            cursor = connection.cursor()
             
-            # 4. 추천 이야기 생성
-            recommendations = [
-                cls.generate_recommendation(data.get('user_input', ''))
-                for _ in range(3)
-            ]
+            # 소유권 확인
+            cursor.execute(
+                """SELECT 1 FROM threads t 
+                   JOIN conversations c ON t.thread_id = c.thread_id 
+                   WHERE t.thread_id = %s AND t.user_id = %s AND c.conversation_id = %s""",
+                (thread_id, user_id, conversation_id)
+            )
+            if not cursor.fetchone():
+                return {"success": False, "error": "Invalid thread_id, conversation_id, or unauthorized"}
             
-            # 최종 결과를 딕셔너리로 yield
-            yield {
-                "created_title": title,
-                "created_content": content,
-                "recommendations": recommendations
-            }
+            # 검색 결과 업데이트
+            for idx, (category, result) in enumerate([
+                ('similar_1', search_results[0] if len(search_results) > 0 else {}),
+                ('similar_2', search_results[1] if len(search_results) > 1 else {}),
+                ('similar_3', search_results[2] if len(search_results) > 2 else {})
+            ], 1):
+                cursor.execute(
+                    """UPDATE conversation_data 
+                       SET data = %s 
+                       WHERE thread_id = %s AND conversation_id = %s AND category = %s""",
+                    (json.dumps(result, ensure_ascii=False), thread_id, conversation_id, category)
+                )
+            
+            # 추천 문서 업데이트
+            for idx, (category, recommendation) in enumerate([
+                ('recommended_1', recommendations[0] if len(recommendations) > 0 else ""),
+                ('recommended_2', recommendations[1] if len(recommendations) > 1 else ""),
+                ('recommended_3', recommendations[2] if len(recommendations) > 2 else "")
+            ], 1):
+                cursor.execute(
+                    """UPDATE conversation_data 
+                       SET data = %s 
+                       WHERE thread_id = %s AND conversation_id = %s AND category = %s""",
+                    (recommendation, thread_id, conversation_id, category)
+                )
+            
+            connection.commit()
+            return {"success": True}
             
         except Exception as e:
-            print(f"[DEBUG] ERROR in generate_story: {str(e)}")
-            print(f"[DEBUG] ERROR traceback: {traceback.format_exc()}")
-            raise e
+            print(f"Error updating search results: {str(e)}")
+            if connection:
+                connection.rollback()
+            return {"success": False, "error": str(e)}
+            
+        finally:
+            if connection and connection.is_connected():
+                cursor.close()
+                connection.close()

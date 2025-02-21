@@ -12,83 +12,6 @@ class StoryService:
     client = OpenAI()
 
     @classmethod
-    def generate_content(cls, prompt):
-        """
-        VAIV API를 사용하여 이야기를 생성하고 스트림으로 반환합니다.
-        """
-        print(f"[DEBUG] Starting generation with prompt: {prompt}")
-        session_hash = generate_session_hash()
-        print(f"[DEBUG] Generated session hash: {session_hash}")
-        
-        # 첫 번째 API 요청 - 큐 참여
-        join_url = 'https://story.vaiv.kr/gradio_api/queue/join'
-        headers = {
-            'Accept': '*/*',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Connection': 'keep-alive',
-            'Content-Type': 'application/json'
-        }
-        
-        payload = {
-            "data": [prompt],
-            "event_data": None,
-            "fn_index": 0,
-            "trigger_id": 4,
-            "session_hash": session_hash
-        }
-        
-        print(f"[DEBUG] Sending join request with payload: {payload}")
-        response = requests.post(join_url, headers=headers, json=payload)
-        print(f"[DEBUG] Join response status: {response.status_code}")
-        print(f"[DEBUG] Join response content: {response.text}")
-        
-        if response.status_code != 200:
-            raise Exception("API 요청 실패")
-        
-        # 두 번째 API 요청 - 데이터 가져오기
-        data_url = f'https://story.vaiv.kr/gradio_api/queue/data?session_hash={session_hash}'
-        headers = {
-            'Accept': 'text/event-stream',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Connection': 'keep-alive'
-        }
-        
-        print(f"[DEBUG] Starting stream request to: {data_url}")
-        with requests.get(data_url, headers=headers, stream=True) as response:
-            print(f"[DEBUG] Stream response status: {response.status_code}")
-            
-            if response.status_code != 200:
-                raise Exception("데이터 가져오기 실패")
-            
-            for line in response.iter_lines():
-                if line:
-                    decoded_line = line.decode('utf-8')
-                    print(f"[DEBUG] Received line: {decoded_line}")
-                    
-                    if decoded_line.startswith('data: '):
-                        try:
-                            data = json.loads(decoded_line[6:])
-                            print(f"[DEBUG] Parsed data: {data}")
-                            
-                            if isinstance(data, dict):
-                                if data.get('msg') == 'process_completed':
-                                    print("[DEBUG] Process completed")
-                                    break
-                                    
-                                if data.get('output') and data['output'].get('data'):
-                                    content = data['output']['data'][0]
-                                    is_generating = data['output'].get('is_generating', True)
-                                    print(f"[DEBUG] Content: {content}, is_generating: {is_generating}")
-                                    
-                                    if content and not is_generating:
-                                        print(f"[DEBUG] Yielding content: {content}")
-                                        yield content
-                                        
-                        except json.JSONDecodeError as e:
-                            print(f"[DEBUG] JSON decode error: {e}")
-                            continue
-
-    @classmethod
     def generate_title(cls, content):
         """제목 생성"""
         completion = cls.client.chat.completions.create(
@@ -104,17 +27,6 @@ class StoryService:
            (title.startswith("'") and title.endswith("'")):
             return title[1:-1]
         return title
-
-    def generate_title(cls, content):
-        """제목 생성"""
-        completion = cls.client.chat.completions.create(
-            model=Config.GPT_MODEL,
-            messages=[
-                {"role": "system", "content": "다음 고전소설 단락에 어울리는 **간략한 제목**을 생성해. **제목은 절대로 13글자를 넘기지 마.**"},
-                {"role": "user", "content": content}
-            ]
-        )
-        return completion.choices[0].message.content
 
     @classmethod
     def generate_recommendation(cls, theme):

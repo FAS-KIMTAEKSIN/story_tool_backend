@@ -98,6 +98,22 @@ class StoryService:
                 {"role": "user", "content": content}
             ]
         )
+        title = completion.choices[0].message.content
+        # 양쪽에 따옴표가 있는 경우에만 제거 (큰따옴표 또는 작은따옴표)
+        if (title.startswith('"') and title.endswith('"')) or \
+           (title.startswith("'") and title.endswith("'")):
+            return title[1:-1]
+        return title
+
+    def generate_title(cls, content):
+        """제목 생성"""
+        completion = cls.client.chat.completions.create(
+            model=Config.GPT_MODEL,
+            messages=[
+                {"role": "system", "content": "다음 고전소설 단락에 어울리는 **간략한 제목**을 생성해. **제목은 절대로 13글자를 넘기지 마.**"},
+                {"role": "user", "content": content}
+            ]
+        )
         return completion.choices[0].message.content
 
     @classmethod

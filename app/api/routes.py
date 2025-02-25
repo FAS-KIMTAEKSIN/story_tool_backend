@@ -10,6 +10,7 @@ import json
 from app.services.history_service import HistoryService
 from app.services.evaluation_service import EvaluationService
 import traceback
+import time
 
 api_bp = Blueprint('api', __name__)
 
@@ -117,6 +118,7 @@ def generate_story():
                     "conversation_id": conversation_id,
                     "user_id": user_id
                 }
+                time.sleep(0.1) # 마지막 응답 지연
                 yield f"data: {json.dumps(final_result, ensure_ascii=False)}\n\n"
                 
             except Exception as e:

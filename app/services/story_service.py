@@ -50,109 +50,84 @@ class StoryService:
     @classmethod
     def save_to_database(cls, user_id, data, formatted_data):
         """생성된 결과를 데이터베이스에 저장"""
-        connection = Database.get_connection()
-        if not connection:
-            return None, None
-            
-        try:
-            print(f"[INFO] Saving story to database for user_id: {user_id}")
-            cursor = connection.cursor()
-            
-            # thread_id가 없거나 null이거나 빈 문자열이면 새 thread 생성
-            thread_id = data.get('thread_id')  # None if key doesn't exist or value is null
-            
-            if thread_id:  # thread_id가 있는 경우 유효성 검사
-                try:
-                    # 정수로 변환 시도
-                    thread_id = int(thread_id)
-                    
-                    # thread가 존재하고 해당 user의 것인지 확인
-                    cursor.execute(
-                        "SELECT 1 FROM threads WHERE thread_id = %s AND user_id = %s",
-                        (thread_id, user_id)
-                    )
-                    if not cursor.fetchone():
-                        # 유효하지 않은 thread_id면 새로 생성
+        def transaction_callback(cursor):
+            try:
+                thread_id = data.get('thread_id')
+                
+                if thread_id:  # thread_id가 있는 경우 유효성 검사
+                    try:
+                        thread_id = int(thread_id)
+                        cursor.execute(
+                            """SELECT 1 FROM threads 
+                               WHERE thread_id = %s AND user_id = %s 
+                               FOR UPDATE""",
+                            (thread_id, user_id)
+                        )
+                        if not cursor.fetchone():
+                            thread_id = None
+                    except (ValueError, TypeError):
                         thread_id = None
-                        
-                except (ValueError, TypeError):
-                    # 정수로 변환 실패하면 새로 생성
-                    thread_id = None
-            
-            if not thread_id:  # 새 thread 생성
-                # 첫 번째 conversation의 제목을 thread title로 설정
+                
+                if not thread_id:  # 새 thread 생성
+                    thread_id = Database.get_next_thread_id(cursor, user_id)
+                    cursor.execute(
+                        """INSERT INTO threads (thread_id, user_id, title) 
+                           VALUES (%s, %s, %s)""",
+                        (thread_id, user_id, formatted_data.get('created_title', ''))
+                    )
+                else:
+                    # 기존 thread의 updated_at 업데이트
+                    cursor.execute(
+                        """UPDATE threads 
+                           SET updated_at = CURRENT_TIMESTAMP 
+                           WHERE thread_id = %s""",
+                        (thread_id,)
+                    )
+                
+                # 새로운 conversation_id 생성
+                conversation_id = Database.get_next_conversation_id(cursor, thread_id)
+                
+                # conversation 생성
                 cursor.execute(
-                    "INSERT INTO threads (user_id, title) VALUES (%s, %s)",
-                    (user_id, formatted_data.get('created_title', ''))
+                    """INSERT INTO conversations 
+                       (conversation_id, thread_id) 
+                       VALUES (%s, %s)""",
+                    (conversation_id, thread_id)
                 )
-                thread_id = cursor.lastrowid
-            else:
-                # 기존 thread의 updated_at 업데이트
-                cursor.execute(
-                    "UPDATE threads SET updated_at = CURRENT_TIMESTAMP WHERE thread_id = %s",
-                    (thread_id,)
-                )
-            
-            # 해당 thread의 마지막 conversation_id 조회
-            cursor.execute(
-                """SELECT MAX(conversation_id) 
-                   FROM conversations 
-                   WHERE thread_id = %s""",
-                (thread_id,)
-            )
-            max_conversation_id = cursor.fetchone()[0]
-            conversation_id = (max_conversation_id or 0) + 1
-            
-            # conversation 생성
-            cursor.execute(
-                """INSERT INTO conversations 
-                   (conversation_id, thread_id) 
-                   VALUES (%s, %s)""",
-                (conversation_id, thread_id)
-            )
-            
-            # conversation_data 저장
-            data_entries = [
-                ('user_input', formatted_data.get('user_input', '')),
-                ('tags', json.dumps(formatted_data.get('tags', {}), ensure_ascii=False)),
-                ('created_title', formatted_data.get('created_title', '')),
-                ('created_content', formatted_data.get('created_content', '')),
-                ('similar_1', '{}'),
-                ('similar_2', '{}'),
-                ('similar_3', '{}'),
-                ('recommended_1', ''),
-                ('recommended_2', ''),
-                ('recommended_3', '')
-            ]
-            
-            # 각 데이터 항목을 개별적으로 저장
-            for category, value in data_entries:
-                try:
+                
+                # conversation_data 저장
+                data_entries = [
+                    ('user_input', formatted_data.get('user_input', '')),
+                    ('tags', json.dumps(formatted_data.get('tags', {}), ensure_ascii=False)),
+                    ('created_title', formatted_data.get('created_title', '')),
+                    ('created_content', formatted_data.get('created_content', '')),
+                    ('similar_1', '{}'),
+                    ('similar_2', '{}'),
+                    ('similar_3', '{}'),
+                    ('recommended_1', ''),
+                    ('recommended_2', ''),
+                    ('recommended_3', '')
+                ]
+                
+                for category, value in data_entries:
                     cursor.execute(
                         """INSERT INTO conversation_data 
                            (conversation_id, thread_id, category, data) 
                            VALUES (%s, %s, %s, %s)""",
                         (conversation_id, thread_id, category, value)
                     )
-                except Exception as e:
-                    print(f"[ERROR] Failed to insert {category}: {str(e)}")
-                    raise
-            
-            connection.commit()
-            print(f"[INFO] Successfully saved story. thread_id: {thread_id}, conversation_id: {conversation_id}")
-            return thread_id, conversation_id
-            
+                
+                return thread_id, conversation_id
+            except Exception as e:
+                print(f"[ERROR] Transaction callback error: {str(e)}")
+                raise  # 상위 트랜잭션 핸들러로 예외 전파
+
+        try:
+            return Database.execute_transaction(transaction_callback)
         except Exception as e:
             print(f"[ERROR] Failed to save to database: {str(e)}")
             print(f"[ERROR] {traceback.format_exc()}")
-            if connection:
-                connection.rollback()
             return None, None
-            
-        finally:
-            if connection and connection.is_connected():
-                cursor.close()
-                connection.close()
 
     @classmethod
     def generate_story(cls, data):

@@ -90,4 +90,58 @@ class Database:
                 self.connection.commit()
             else:
                 self.connection.rollback()
-            self.connection.close() 
+            self.connection.close()
+
+    @staticmethod
+    def execute_transaction(callback):
+        """트랜잭션으로 실행할 콜백 함수를 처리합니다"""
+        connection = Database.get_connection()
+        if not connection:
+            return None
+            
+        try:
+            cursor = connection.cursor(dictionary=True)
+            # 트랜잭션 시작
+            connection.start_transaction(isolation_level='REPEATABLE READ')
+            
+            # 콜백 실행
+            result = callback(cursor)
+            
+            # 트랜잭션 커밋
+            connection.commit()
+            return result
+            
+        except Exception as e:
+            print(f"Transaction error: {str(e)}")
+            if connection:
+                connection.rollback()
+            raise
+            
+        finally:
+            if connection and connection.is_connected():
+                cursor.close()
+                connection.close()
+
+    @staticmethod
+    def get_next_thread_id(cursor, user_id):
+        """다음 thread_id를 안전하게 가져옵니다"""
+        cursor.execute(
+            """SELECT MAX(thread_id) + 1 as next_id 
+               FROM threads 
+               FOR UPDATE"""
+        )
+        next_id = cursor.fetchone()['next_id'] or 1
+        return next_id
+
+    @staticmethod
+    def get_next_conversation_id(cursor, thread_id):
+        """다음 conversation_id를 안전하게 가져옵니다"""
+        cursor.execute(
+            """SELECT MAX(conversation_id) + 1 as next_id 
+               FROM conversations 
+               WHERE thread_id = %s 
+               FOR UPDATE""",
+            (thread_id,)
+        )
+        next_id = cursor.fetchone()['next_id'] or 1
+        return next_id 

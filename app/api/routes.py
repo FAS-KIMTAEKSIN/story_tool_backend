@@ -66,23 +66,22 @@ def generate_story():
 
         def generate():
             try:
-                # 스트림 시작을 알림
-                yield "data: {\"status\": \"generating\"}\n\n"
-                
-                # 이야기 생성 및 실시간 스트리밍
-                story_generator = StoryService.generate_story(data)
+                story_generator = StoryService.hybrid_generate_story(data)
                 final_content = None
                 generated_result = None
                 
-                for content in story_generator:
-                    if isinstance(content, dict):  # 최종 결과인 경우
-                        generated_result = content
-                        final_content = content['created_content']
-                        break
-                    else:  # 생성 중인 컨텐츠인 경우
-                        final_content = content
-                        yield f"data: {json.dumps(content)}\n\n"
-                
+                for message in story_generator:
+                    yield message  # 이미 SSE 형식으로 포맷팅된 메시지
+                    
+                    # JSON 파싱하여 최종 결과 확인
+                    try:
+                        parsed = json.loads(message.replace('data: ', ''))
+                        if 'created_content' in parsed:
+                            generated_result = parsed
+                            final_content = parsed['created_content']
+                    except:
+                        continue
+
                 if not generated_result or not final_content:
                     raise Exception("이야기 생성 실패: 결과가 비어있음")
                 
@@ -118,12 +117,12 @@ def generate_story():
                     "conversation_id": conversation_id,
                     "user_id": user_id
                 }
-                yield f"data: {json.dumps(final_result)}\n\n"
+                yield f"data: {json.dumps(final_result, ensure_ascii=False)}\n\n"
                 
             except Exception as e:
                 print(f"[ERROR] Failed to generate story: {str(e)}")
                 print(f"[ERROR] {traceback.format_exc()}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
         return Response(
             stream_with_context(generate()),
@@ -281,12 +280,12 @@ def generate_with_search():
                     "conversation_id": conversation_id,
                     "user_id": user_id
                 }
-                yield f"data: {json.dumps(final_result)}\n\n"
+                yield f"data: {json.dumps(final_result, ensure_ascii=False)}\n\n"
                 
             except Exception as e:
                 print(f"[DEBUG] Error in generate function: {str(e)}")
                 print(f"[DEBUG] Error traceback: {traceback.format_exc()}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
         return Response(
             stream_with_context(generate()),

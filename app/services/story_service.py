@@ -336,3 +336,119 @@ class StoryService:
             if connection and connection.is_connected():
                 cursor.close()
                 connection.close()
+
+    @classmethod
+    def _expand_with_gpt4o(cls, base_story):
+        """GPT-4o로 스토리 확장 (스트리밍)"""
+        try:
+            expanded_story = ""
+            response = cls.client.chat.completions.create(
+                model=Config.GPT_MODEL,
+                messages=[
+                    {"role": "system", "content": Config.HYBRID_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"다음 이야기를 더 풍부하게 확장해주세요:\n\n{base_story}"}
+                ],
+                temperature=0.7,
+                max_tokens=2048,
+                stream=True
+            )
+            
+            for chunk in response:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    expanded_story += content
+                    # 실제 컨텐츠가 있는 경우에만 스트리밍
+                    if content.strip():
+                        yield content
+            
+            return expanded_story
+            
+        except Exception as e:
+            print(f"[ERROR] Error in GPT-4o expansion: {str(e)}")
+            return None
+
+    @classmethod
+    def hybrid_generate_story(cls, data):
+        """하이브리드 방식으로 이야기 생성 및 스트리밍"""
+        try:
+            # 스트림 시작을 알림
+            yield "data: {\"status\": \"generating\"}\n\n"
+            
+            # 1. 파인튜닝된 모델로 기본 스토리 생성
+            prompt = cls._format_hybrid_prompt(data)
+            print(f"\n[DEBUG] Fine-tuned model prompt: {json.dumps(prompt, ensure_ascii=False)}")
+            
+            base_story = cls._generate_with_fine_tuned_model(prompt)
+            print(f"\n[DEBUG] Fine-tuned model response: {base_story}")
+            
+            if not base_story:
+                raise Exception("기본 스토리 생성 실패")
+                
+            # 중간 결과 전달
+            yield f"data: {json.dumps({'msg': 'base_story_completed', 'content': base_story}, ensure_ascii=False)}\n\n"
+            
+            # 2. GPT-4o로 스토리 확장 (스트리밍)
+            print("\n[DEBUG] Starting GPT-4o expansion...")
+            expanded_story = ""
+            for content in cls._expand_with_gpt4o(base_story):
+                expanded_story += content
+                yield f"data: {json.dumps({'msg': 'expanding', 'content': content}, ensure_ascii=False)}\n\n"
+            
+            print(f"\n[DEBUG] Final expanded story: {expanded_story}")
+            
+            if not expanded_story:
+                raise Exception("스토리 확장 실패")
+            
+            # 제목 생성
+            title = cls.generate_title(expanded_story)
+            print(f"\n[DEBUG] Generated title: {title}")
+            
+            # 최종 결과 포맷팅
+            result = {
+                "created_title": title,
+                "created_content": expanded_story
+            }
+            
+            yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
+            
+        except Exception as e:
+            print(f"[ERROR] Failed in hybrid story generation: {str(e)}")
+            print(f"[ERROR] {traceback.format_exc()}")
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+    @classmethod
+    def _format_hybrid_prompt(cls, data):
+        """하이브리드 생성용 프롬프트 포맷팅"""
+        from app.services.search_service import SearchService
+        
+        theme = data.get('user_input', '')
+        tags = data.get('tags', {})
+        keywords = SearchService.extract_keywords_from_theme(theme)
+        
+        return {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": Config.STORY_GENERATION_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": f"[내용 분류]\n{tags}\n\n[주제어]\n{keywords}\n\n[주제문]\n{theme}"
+                }
+            ]
+        }
+
+    @classmethod
+    def _generate_with_fine_tuned_model(cls, prompt):
+        """파인튜닝된 모델로 스토리 생성"""
+        try:
+            response = cls.client.chat.completions.create(
+                model=Config.FINE_TUNED_MODEL,
+                messages=prompt["messages"],
+                temperature=0.7,
+                max_tokens=1024
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"[ERROR] Error in fine-tuned generation: {str(e)}")
+            return None

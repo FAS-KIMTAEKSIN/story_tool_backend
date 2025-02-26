@@ -316,6 +316,7 @@ class StoryService:
     def _expand_with_gpt4o(cls, base_story):
         """GPT-4o로 스토리 확장 (스트리밍)"""
         try:
+            print("[DEBUG] Creating GPT-4o completion request...")
             expanded_story = ""
             response = cls.client.chat.completions.create(
                 model=Config.GPT_MODEL,
@@ -327,19 +328,25 @@ class StoryService:
                 max_tokens=2048,
                 stream=True
             )
+            print("[DEBUG] GPT-4o request created, starting stream...")
             
             for chunk in response:
-                if chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
-                    expanded_story += content
-                    # 실제 컨텐츠가 있는 경우에만 스트리밍
-                    if content.strip():
+                try:
+                    if chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        expanded_story += content
+                        print(f"[DEBUG] Received chunk: {content[:50]}...")  # 청크 내용 출력
                         yield content
+                except Exception as e:
+                    print(f"[ERROR] Error processing chunk: {str(e)}")
+                    continue
             
+            print(f"[DEBUG] Stream completed. Total length: {len(expanded_story)}")
             return expanded_story
             
         except Exception as e:
             print(f"[ERROR] Error in GPT-4o expansion: {str(e)}")
+            print(f"[ERROR] Full traceback: {traceback.format_exc()}")
             return None
 
     @classmethod

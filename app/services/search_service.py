@@ -5,7 +5,9 @@ import numpy as np
 import json
 from app.utils.helpers import parse_content_to_json
 from app.config import Config
+from app.services.story_service import StoryService
 import os
+import traceback
 
 class SearchService:
     client = OpenAI()
@@ -181,8 +183,6 @@ class SearchService:
     @classmethod
     def get_recommendations(cls, data):
         """추천 문서 생성"""
-        from app.services.story_service import StoryService
-        
         recommendations = [
             StoryService.generate_recommendation(data.get('user_input', ''))
             for _ in range(3)
@@ -191,19 +191,32 @@ class SearchService:
 
     @classmethod
     def search_and_recommend(cls, data):
-        """문서 검색 및 추천 수행"""
         try:
-            # 문서 검색
+            # 검색 수행
             search_results = cls.search_documents(data)
+            print(f"[DEBUG] Search results: {json.dumps(search_results, ensure_ascii=False)}")
             
-            # 추천 문서 생성
-            recommendations = cls.get_recommendations(data)
+            # 추천 생성
+            recommendations = []
+            if search_results:
+                for result in search_results[:3]:  # 상위 3개 결과에 대해
+                    recommendation = StoryService.generate_recommendation(
+                        result.get('metadata', {}).get('주제문', '')
+                    )
+                    if recommendation:
+                        recommendations.append(recommendation)
+                        
+            print(f"[DEBUG] Generated recommendations: {json.dumps(recommendations, ensure_ascii=False)}")
             
             return {
-                "search_results": search_results,
-                "recommendations": recommendations
+                'search_results': search_results[:3] if search_results else [],
+                'recommendations': recommendations[:3] if recommendations else []
             }
             
         except Exception as e:
-            print(f"Error in search_and_recommend: {str(e)}")
-            raise 
+            print(f"[ERROR] Failed in search_and_recommend: {str(e)}")
+            print(f"[ERROR] {traceback.format_exc()}")
+            return {
+                'search_results': [],
+                'recommendations': []
+            } 

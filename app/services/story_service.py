@@ -318,6 +318,8 @@ class StoryService:
         try:
             print("[DEBUG] Creating GPT-4o completion request...")
             expanded_story = ""
+            buffer = ""  # 버퍼 추가
+            
             response = cls.client.chat.completions.create(
                 model=Config.GPT_MODEL,
                 messages=[
@@ -334,12 +336,24 @@ class StoryService:
                 try:
                     if chunk.choices[0].delta.content:
                         content = chunk.choices[0].delta.content
+                        buffer += content  # 버퍼에 추가
                         expanded_story += content
-                        print(f"[DEBUG] Received chunk: {content[:50]}...")  # 청크 내용 출력
-                        yield content
+                        print(f"[DEBUG] Received chunk: {content[:50]}...")
+                        
+                        # 버퍼가 일정 크기가 되거나 문장이 끝나면 yield
+                        if len(buffer) >= 30 or any(buffer.endswith(end) for end in ['.', '!', '?', '\n']):
+                            yield buffer
+                            buffer = ""  # 버퍼 초기화
                 except Exception as e:
                     print(f"[ERROR] Error processing chunk: {str(e)}")
+                    if buffer:  # 오류 발생 시 버퍼 내용 전송
+                        yield buffer
+                        buffer = ""
                     continue
+            
+            # 남은 버퍼가 있으면 전송
+            if buffer:
+                yield buffer
             
             print(f"[DEBUG] Stream completed. Total length: {len(expanded_story)}")
             return expanded_story
@@ -358,10 +372,10 @@ class StoryService:
             
             # 1. 파인튜닝된 모델로 기본 스토리 생성
             prompt = cls._format_hybrid_prompt(data)
-            print(f"\n[DEBUG] Fine-tuned model prompt: {json.dumps(prompt, ensure_ascii=False)}")
+            print(f"\n[DEBUG] Fine-tuned model prompt: {json.dumps(prompt, ensure_ascii=False)}", flush=True)
             
             base_story = cls._generate_with_fine_tuned_model(prompt)
-            print(f"\n[DEBUG] Fine-tuned model response: {base_story}")
+            print(f"\n[DEBUG] Fine-tuned model response: {base_story}", flush=True)
             
             if not base_story:
                 raise Exception("기본 스토리 생성 실패")
@@ -370,20 +384,21 @@ class StoryService:
             yield f"data: {json.dumps({'msg': 'base_story_completed', 'content': base_story}, ensure_ascii=False)}\n\n"
             
             # 2. GPT-4o로 스토리 확장 (스트리밍)
-            print("\n[DEBUG] Starting GPT-4o expansion...")
+            print("\n[DEBUG] Starting GPT-4o expansion...", flush=True)
             expanded_story = ""
             for content in cls._expand_with_gpt4o(base_story):
                 expanded_story += content
                 yield f"data: {json.dumps({'msg': 'expanding', 'content': content}, ensure_ascii=False)}\n\n"
+                print(".", end="", flush=True)  # 진행 상황 표시
             
-            print(f"\n[DEBUG] Final expanded story: {expanded_story}")
+            print(f"\n[DEBUG] Final expanded story: {expanded_story}", flush=True)
             
             if not expanded_story:
                 raise Exception("스토리 확장 실패")
             
             # 제목 생성
             title = cls.generate_title(expanded_story)
-            print(f"\n[DEBUG] Generated title: {title}")
+            print(f"\n[DEBUG] Generated title: {title}", flush=True)
             
             # 최종 결과 포맷팅
             result = {

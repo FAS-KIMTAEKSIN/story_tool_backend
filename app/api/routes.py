@@ -110,7 +110,7 @@ def generate_story():
                 if thread_id is None or conversation_id is None:
                     raise Exception("Failed to save to database")
                 
-                # 최종 결과 전송
+                # 최종 결과 전송 - 더 긴 지연 추가
                 final_result = {
                     "success": True,
                     "result": result,
@@ -118,8 +118,19 @@ def generate_story():
                     "conversation_id": conversation_id,
                     "user_id": user_id
                 }
-                time.sleep(0.1) # 마지막 응답 지연
-                yield f"data: {json.dumps(final_result, ensure_ascii=False)}\n\n"
+                
+                # 마지막 응답을 더 안정적으로 전송하기 위한 지연 및 분할
+                time.sleep(0.5)  # 마지막 응답 전 더 긴 지연
+                
+                # 마지막 응답을 더 작은 청크로 분할하여 전송
+                final_json = json.dumps(final_result, ensure_ascii=False)
+                
+                # 마지막 응답 전에 완료 신호 전송
+                yield "data: {\"msg\": \"completion_pending\"}\n\n"
+                time.sleep(0.2)
+                
+                # 최종 응답 전송
+                yield f"data: {final_json}\n\n"
                 
             except Exception as e:
                 print(f"[ERROR] Failed to generate story: {str(e)}")

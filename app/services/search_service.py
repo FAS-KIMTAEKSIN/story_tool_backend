@@ -194,7 +194,6 @@ class SearchService:
         try:
             # 검색 수행
             search_results = cls.search_documents(data)
-            print(f"[DEBUG] Search results: {json.dumps(search_results, ensure_ascii=False)}")
             
             # 추천 생성
             recommendations = []
@@ -205,8 +204,6 @@ class SearchService:
                     )
                     if recommendation:
                         recommendations.append(recommendation)
-                        
-            print(f"[DEBUG] Generated recommendations: {json.dumps(recommendations, ensure_ascii=False)}")
             
             return {
                 'search_results': search_results[:3] if search_results else [],

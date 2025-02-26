@@ -338,10 +338,9 @@ class StoryService:
                         content = chunk.choices[0].delta.content
                         buffer += content  # 버퍼에 추가
                         expanded_story += content
-                        print(f"[DEBUG] Received chunk: {content[:50]}...")
                         
-                        # 버퍼가 일정 크기가 되거나 문장이 끝나면 yield
-                        if len(buffer) >= 30 or any(buffer.endswith(end) for end in ['.', '!', '?', '\n']):
+                        # 버퍼가 더 큰 크기(100자)가 되거나 문장이 끝나면 yield
+                        if len(buffer) >= 100 or any(buffer.endswith(end) for end in ['.', '!', '?', '\n']):
                             yield buffer
                             buffer = ""  # 버퍼 초기화
                 except Exception as e:

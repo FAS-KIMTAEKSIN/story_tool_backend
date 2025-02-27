@@ -10,9 +10,10 @@ CREATE TABLE users (
 );
 -- 대화창 테이블
 CREATE TABLE threads (
-    thread_id INT AUTO_INCREMENT PRIMARY KEY,      -- 대화창 고유 ID
-    user_id INT NOT NULL,                          -- 사용자 ID
-    title VARCHAR(255),                            -- 대화창 제목
+    id INT AUTO_INCREMENT PRIMARY KEY,      -- 대화창 고유 ID
+    user_id INT NOT NULL,                   -- 사용자 ID
+    title VARCHAR(255),                     -- 대화창 제목
+    thread_id VARCHAR(255),                 -- OpenAI Assistant API 쓰레드 ID
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- 대화 생성 시간
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
@@ -24,7 +25,7 @@ CREATE TABLE conversations (
     thread_id INT NOT NULL,                        -- 대화창 ID
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY unique_thread_conversation (thread_id, conversation_id),
-    FOREIGN KEY (thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
+    FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
 );
 -- 대화 내용 저장 테이블
 CREATE TABLE conversation_data (

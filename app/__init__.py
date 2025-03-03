@@ -6,7 +6,7 @@ from app.services.story_service import StoryService
 
 # Assistant 초기화 - 애플리케이션 시작 시 한 번만 실행
 def init_app():
-    StoryService.initialize_assistants()
+    StoryService.initialize()
 
 # 초기화 함수 호출
 init_app() 

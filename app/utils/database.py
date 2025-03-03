@@ -150,18 +150,19 @@ class Database:
         return next_id
 
     def execute(self, query, params=None):
-        """SQL 쿼리 실행"""
-        self.cursor.execute(query, params)
-        return self.cursor
+        try:
+            self.cursor.execute(query, params)
+            return self.cursor
+        except mysql.connector.Error as err:
+            print(f"Database error: {err}")
+            raise
+
+    @property
+    def lastrowid(self):
+        return self.cursor.lastrowid
 
     def fetchone(self):
-        """단일 결과 반환"""
         return self.cursor.fetchone()
 
     def fetchall(self):
-        """모든 결과 반환"""
-        return self.cursor.fetchall()
-
-    def lastrowid(self):
-        """마지막 삽입된 행의 ID 반환"""
-        return self.cursor.lastrowid 
+        return self.cursor.fetchall() 

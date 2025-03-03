@@ -274,82 +274,91 @@ class StoryService:
 
     @classmethod
     def save_to_database(cls, user_id, data, result):
-        """생성된 이야기를 데이터베이스에 저장"""
+        """데이터베이스에 저장"""
         try:
+            thread_id = None
+            conversation_id = None
+            
             with Database() as db:
-                # 트랜잭션 시작 - Database 클래스에서 처리해야 함
-                # 먼저 thread 생성
-                openai_thread_id = getattr(cls, 'current_openai_thread_id', None)
-                title = result.get('created_title', '새 이야기')
+                # 1. 먼저 thread 테이블에 저장
+                # 이미 동일한 OpenAI 쓰레드 ID가 있는지 확인
+                if cls.current_openai_thread_id:
+                    db.execute(
+                        """SELECT id FROM threads 
+                           WHERE thread_id = %s LIMIT 1""",
+                        (cls.current_openai_thread_id,)
+                    )
+                    existing_thread = db.fetchone()
+                    if existing_thread:
+                        thread_id = existing_thread['id']
+                        print(f"[DEBUG] Found existing thread with same OpenAI thread_id: {thread_id}")
                 
+                # 없으면 새로 생성
+                if not thread_id:
+                    db.execute(
+                        """INSERT INTO threads (user_id, title, thread_id) 
+                           VALUES (%s, %s, %s)""",
+                        (user_id, result.get('created_title', '새 이야기'), cls.current_openai_thread_id)
+                    )
+                    thread_id = db.cursor.lastrowid
+                    print(f"[DEBUG] New thread created with id: {thread_id}")
+                
+                # 2. conversation 테이블에 저장
+                # 현재 thread_id에서 가장 큰 conversation_id 가져오기
                 db.execute(
-                    """INSERT INTO threads (user_id, title, thread_id) VALUES (%s, %s, %s)""",
-                    (user_id, title, openai_thread_id)
+                    """SELECT MAX(conversation_id) as max_id FROM conversations 
+                       WHERE thread_id = %s""",
+                    (thread_id,)
                 )
-                db_thread_id = db.lastrowid()
+                max_id_row = db.fetchone()
+                next_id = 1
+                if max_id_row and max_id_row['max_id'] is not None:
+                    next_id = max_id_row['max_id'] + 1
                 
-                # conversation 추가
+                # conversation 삽입
                 db.execute(
-                    """INSERT INTO conversations (thread_id, conversation_id) 
+                    """INSERT INTO conversations (conversation_id, thread_id) 
                        VALUES (%s, %s)""",
-                    (db_thread_id, 1)  # 첫 번째 대화는 1
+                    (next_id, thread_id)
                 )
+                conversation_id = next_id
                 
-                # conversation_data에 컨텐츠 데이터 추가
-                cls._insert_conversation_data_batch(db, db_thread_id, 1, data, result)
+                # 3. conversation_data에 다양한 데이터 저장
+                data_to_insert = [
+                    ('user_input', data.get('user_input', '')),
+                    ('tags', json.dumps(data.get('tags', {}), ensure_ascii=False)),
+                    ('created_title', result.get('created_title', '')),
+                    ('created_content', result.get('created_content', '')),
+                ]
                 
-                print(f"[INFO] Saved to database: thread_id={db_thread_id}, conversation_id=1")
+                # 추천 데이터 추가
+                recommendations = result.get('recommendations', [])
+                for i, rec in enumerate(recommendations[:3], 1):
+                    data_to_insert.append((f'recommended_{i}', rec))
                 
-                # 변수 초기화
-                cls.current_openai_thread_id = None
+                # 데이터 삽입
+                for category, value in data_to_insert:
+                    db.execute(
+                        """INSERT INTO conversation_data (conversation_id, thread_id, category, data) 
+                           VALUES (%s, %s, %s, %s)""",
+                        (conversation_id, thread_id, category, value)
+                    )
                 
-                return db_thread_id, 1
-                
+                return thread_id, conversation_id
         except Exception as e:
             print(f"[ERROR] Failed to save to database: {str(e)}")
             print(f"[ERROR] {traceback.format_exc()}")
             return None, None
 
     @classmethod
-    def _insert_conversation_data_batch(cls, db, thread_id, conversation_id, data, result):
-        """대화 데이터를 일괄 저장"""
+    def _insert_conversation_data(cls, db, thread_id, conversation_id, category, data):
+        """대화 데이터를 저장하는 내부 메소드"""
         try:
-            # 사용자 입력
             db.execute(
                 """INSERT INTO conversation_data (thread_id, conversation_id, category, data) 
                    VALUES (%s, %s, %s, %s)""",
-                (thread_id, conversation_id, 'user_input', data.get('user_input', ''))
+                (thread_id, conversation_id, category, data)
             )
-            
-            # 태그 정보
-            db.execute(
-                """INSERT INTO conversation_data (thread_id, conversation_id, category, data) 
-                   VALUES (%s, %s, %s, %s)""",
-                (thread_id, conversation_id, 'tags', json.dumps(data.get('tags', {}), ensure_ascii=False))
-            )
-            
-            # 제목
-            db.execute(
-                """INSERT INTO conversation_data (thread_id, conversation_id, category, data) 
-                   VALUES (%s, %s, %s, %s)""",
-                (thread_id, conversation_id, 'created_title', result.get('created_title', ''))
-            )
-            
-            # 생성된 내용
-            db.execute(
-                """INSERT INTO conversation_data (thread_id, conversation_id, category, data) 
-                   VALUES (%s, %s, %s, %s)""",
-                (thread_id, conversation_id, 'created_content', result.get('created_content', ''))
-            )
-            
-            # 추천 저장
-            recommendations = result.get('recommendations', [])
-            for i, rec in enumerate(recommendations[:3], 1):
-                db.execute(
-                    """INSERT INTO conversation_data (thread_id, conversation_id, category, data) 
-                       VALUES (%s, %s, %s, %s)""",
-                    (thread_id, conversation_id, f'recommended_{i}', rec)
-                )
         except Exception as e:
             print(f"[ERROR] Failed to insert conversation data: {str(e)}")
             print(f"[ERROR] {traceback.format_exc()}")
@@ -854,94 +863,170 @@ class StoryService:
             
             # 기존 쓰레드 ID가 있으면 가져옴
             existing_thread_id = data.get('openai_thread_id')
+            existing_db_thread_id = data.get('thread_id')
+            existing_conversation_id = data.get('conversation_id')
             
             # 스트림 시작을 알림
             yield "data: {\"status\": \"generating\"}\n\n"
             
-            # 1. 파인튜닝된 모델로 기본 스토리 생성
-            prompt = cls._format_hybrid_prompt(data)
-            print(f"\n[DEBUG] Fine-tuned model prompt: {json.dumps(prompt, ensure_ascii=False)}", flush=True)
-            
-            base_story = cls._generate_with_fine_tuned_model(prompt)
-            print(f"\n[DEBUG] Fine-tuned model response: {base_story}", flush=True)
-            
-            if not base_story:
-                raise Exception("기본 스토리 생성 실패")
-                
-            # 중간 결과 전달
-            yield f"data: {json.dumps({'msg': 'base_story_completed', 'content': base_story}, ensure_ascii=False)}\n\n"
-            
-            # 2. GPT-4o로 스토리 확장 (스트리밍)
-            print("\n[DEBUG] Starting GPT-4o expansion with user_id:", user_id, flush=True)
+            # 이야기 생성 로직 실행 (OpenAI thread 생성)
             expanded_story = ""
-            
-            # DB에서 이미 저장된 스레드 ID 조회
-            db_thread_id = None
-            if existing_thread_id:
-                try:
-                    with Database() as cursor:
-                        cursor.execute(
-                            """SELECT id FROM threads 
-                               WHERE thread_id = %s LIMIT 1""",
-                            (existing_thread_id,)
-                        )
-                        result = cursor.fetchone()
-                        if result:
-                            db_thread_id = result['id']
-                            print(f"[DEBUG] Found existing DB thread_id: {db_thread_id}")
-                except Exception as e:
-                    print(f"[ERROR] Error querying DB thread: {str(e)}")
-            
-            for content in cls._expand_with_gpt4o(base_story, user_id, existing_thread_id):
-                expanded_story = content  # 전체 내용을 한 번에 받음
-                yield f"data: {json.dumps({'msg': 'expanding', 'content': expanded_story}, ensure_ascii=False)}\n\n"
-                print(".", end="", flush=True)  # 진행 상황 표시
-            
-            print(f"\n[DEBUG] Final expanded story: {expanded_story}", flush=True)
+            openai_thread_id = None
+            for content in cls._expand_with_gpt4o(data.get('user_input', '')):
+                if not openai_thread_id and cls.current_openai_thread_id:
+                    openai_thread_id = cls.current_openai_thread_id
+                expanded_story += content
+                yield f"data: {json.dumps({'msg': 'expanding', 'content': content}, ensure_ascii=False)}\n\n"
             
             if not expanded_story:
-                raise Exception("스토리 확장 실패")
+                raise Exception("이야기 생성 실패")
             
-            # 3. 제목 생성과 추천 생성을 한 번에 처리 (Chat Completion API 사용)
-            title_and_recommendations = cls.generate_title_and_recommendations(
-                expanded_story, 
-                data.get('user_input', '')
-            )
-            
-            title = title_and_recommendations["title"]
-            recommendations = title_and_recommendations["recommendations"]
-            
-            print(f"\n[DEBUG] Generated title: {title}", flush=True)
-            print(f"\n[DEBUG] Generated recommendations: {recommendations}", flush=True)
-            
-            # 최종 결과 포맷팅
-            result = {
-                "created_title": title,
-                "created_content": expanded_story,
-                "recommendations": recommendations
-            }
-            
-            # DB에 저장
-            thread_id = None
-            conversation_id = None
-            
-            if db_thread_id:
-                # 기존 스레드에 대화 추가
-                conversation_id = cls.add_conversation_to_thread(db_thread_id, user_id, data, result)
-                thread_id = db_thread_id
-            else:
-                # 새 스레드 생성
-                thread_id, conversation_id = cls.save_to_database(user_id, data, result)
-            
-            if thread_id and conversation_id:
-                result["thread_id"] = thread_id
-                result["conversation_id"] = conversation_id
-                result["user_id"] = user_id
-                result["openai_thread_id"] = cls.current_openai_thread_id  # 클라이언트에 OpenAI 쓰레드 ID 전달
-            
-            yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
+            # 데이터베이스 연결 및 트랜잭션 시작
+            with Database() as db:
+                db.connection.start_transaction()
+                
+                try:
+                    # 새 thread 생성 또는 기존 thread 사용
+                    if existing_db_thread_id:
+                        thread_id = existing_db_thread_id
+                        # 기존 thread의 OpenAI thread ID 업데이트
+                        if openai_thread_id:
+                            db.execute(
+                                """UPDATE threads SET thread_id = %s WHERE id = %s""",
+                                (openai_thread_id, thread_id)
+                            )
+                    else:
+                        # 새 thread 생성
+                        db.execute(
+                            """INSERT INTO threads (user_id, title, thread_id) VALUES (%s, %s, %s)""",
+                            (user_id, "새 이야기", openai_thread_id)
+                        )
+                        thread_id = db.lastrowid
+                        print(f"[DEBUG] Created new thread with id: {thread_id}, openai_thread_id: {openai_thread_id}")
+                    
+                    # conversation 생성
+                    if existing_conversation_id:
+                        conversation_id = existing_conversation_id
+                    else:
+                        # 다음 conversation_id 가져오기
+                        db.execute(
+                            """SELECT COALESCE(MAX(conversation_id), 0) + 1 as next_id 
+                               FROM conversations WHERE thread_id = %s""",
+                            (thread_id,)
+                        )
+                        next_id = db.fetchone()['next_id']
+                        
+                        # conversation 추가
+                        db.execute(
+                            """INSERT INTO conversations (thread_id, conversation_id) 
+                               VALUES (%s, %s)""",
+                            (thread_id, next_id)
+                        )
+                        conversation_id = next_id
+                        print(f"[DEBUG] Created new conversation with id: {conversation_id}")
+                    
+                    # 임시 데이터 저장
+                    cls._insert_conversation_data(db, thread_id, conversation_id, 'user_input', data.get('user_input', ''))
+                    cls._insert_conversation_data(db, thread_id, conversation_id, 'tags', json.dumps(data.get('tags', {}), ensure_ascii=False))
+                    cls._insert_conversation_data(db, thread_id, conversation_id, 'created_title', "새 이야기")
+                    cls._insert_conversation_data(db, thread_id, conversation_id, 'created_content', expanded_story)
+                    
+                    # 제목 생성
+                    title_and_recommendations = cls.generate_title_and_recommendations(
+                        expanded_story, 
+                        data.get('user_input', '')
+                    )
+                    
+                    title = title_and_recommendations["title"]
+                    recommendations = title_and_recommendations["recommendations"]
+                    
+                    # 제목 업데이트 (threads 테이블)
+                    db.execute(
+                        """UPDATE threads SET title = %s WHERE id = %s""",
+                        (title, thread_id)
+                    )
+                    
+                    # 제목 업데이트 (conversation_data 테이블)
+                    db.execute(
+                        """UPDATE conversation_data 
+                           SET data = %s 
+                           WHERE thread_id = %s AND conversation_id = %s AND category = 'created_title'""",
+                        (title, thread_id, conversation_id)
+                    )
+                    
+                    # 추천 저장
+                    for i, rec in enumerate(recommendations[:3], 1):
+                        cls._insert_conversation_data(db, thread_id, conversation_id, f'recommended_{i}', rec)
+                    
+                    # 트랜잭션 커밋
+                    db.connection.commit()
+                    print(f"[DEBUG] All data saved successfully: thread_id={thread_id}, openai_thread_id={openai_thread_id}")
+                    
+                    # 최종 결과 포맷팅
+                    result = {
+                        "created_title": title,
+                        "created_content": expanded_story,
+                        "recommendations": recommendations,
+                        "thread_id": thread_id,
+                        "conversation_id": conversation_id,
+                        "user_id": user_id,
+                        "openai_thread_id": openai_thread_id
+                    }
+                    
+                    yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
+                    
+                except Exception as tx_error:
+                    db.connection.rollback()
+                    print(f"[ERROR] Transaction failed: {str(tx_error)}")
+                    raise tx_error
             
         except Exception as e:
             print(f"[ERROR] Failed in hybrid story generation: {str(e)}")
             print(f"[ERROR] {traceback.format_exc()}")
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+    @classmethod
+    def update_conversation(cls, thread_id, conversation_id, result):
+        """기존 대화를 업데이트"""
+        try:
+            with Database() as db:
+                # 먼저 threads 테이블의 제목 업데이트
+                db.execute(
+                    """UPDATE threads SET title = %s WHERE id = %s""",
+                    (result.get('created_title', '새 이야기'), thread_id)
+                )
+                print(f"[DEBUG] Updated thread title: id={thread_id}, title={result.get('created_title', '새 이야기')}")
+                
+                # conversation_data 업데이트
+                # 제목 업데이트
+                db.execute(
+                    """UPDATE conversation_data 
+                       SET data = %s 
+                       WHERE thread_id = %s AND conversation_id = %s AND category = 'created_title'""",
+                    (result.get('created_title', ''), thread_id, conversation_id)
+                )
+                
+                # 내용 업데이트
+                db.execute(
+                    """UPDATE conversation_data 
+                       SET data = %s 
+                       WHERE thread_id = %s AND conversation_id = %s AND category = 'created_content'""",
+                    (result.get('created_content', ''), thread_id, conversation_id)
+                )
+                
+                # 추천 업데이트
+                recommendations = result.get('recommendations', [])
+                for i, rec in enumerate(recommendations[:3], 1):
+                    db.execute(
+                        """UPDATE conversation_data 
+                           SET data = %s 
+                           WHERE thread_id = %s AND conversation_id = %s AND category = %s""",
+                        (rec, thread_id, conversation_id, f'recommended_{i}')
+                    )
+                
+                print(f"[INFO] Updated conversation: thread_id={thread_id}, conversation_id={conversation_id}")
+                return True
+        except Exception as e:
+            print(f"[ERROR] Failed to update conversation: {str(e)}")
+            print(f"[ERROR] {traceback.format_exc()}")
+            return False

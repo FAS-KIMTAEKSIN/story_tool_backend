@@ -75,6 +75,13 @@ def generate_story():
             
         def generate():
             try:
+                # thread_id와 conversation_id가 제공된 경우 그대로 사용
+                thread_id = data.get('thread_id')
+                conversation_id = data.get('conversation_id')
+                
+                if thread_id and conversation_id:
+                    print(f"[DEBUG] Using provided thread_id={thread_id}, conversation_id={conversation_id}")
+                
                 story_generator = StoryService.hybrid_generate_story_with_assistant(data)
                 final_content = None
                 generated_result = None
@@ -87,20 +94,25 @@ def generate_story():
                     # JSON 파싱하여 최종 결과 확인
                     try:
                         parsed = json.loads(message.replace('data: ', ''))
+                        
+                        # 생성된 대화 정보 캡처
+                        if 'conversation_created' in parsed.get('msg', ''):
+                            thread_id = parsed.get('thread_id')
+                            conversation_id = parsed.get('conversation_id')
+                            
+                        # 최종 결과 캡처
                         if 'created_content' in parsed:
                             generated_result = parsed
                             final_content = parsed['created_content']
                             recommendations = parsed.get('recommendations', ["", "", ""])
                             openai_thread_id = parsed.get('openai_thread_id')
+                            thread_id = parsed.get('thread_id', thread_id)
+                            conversation_id = parsed.get('conversation_id', conversation_id)
                     except:
                         continue
 
-                if not generated_result or not final_content:
-                    raise Exception("이야기 생성 실패: 결과가 비어있음")
-                
-                # thread_id와 conversation_id가 이미 result에 있으면 그것을 사용
-                thread_id = generated_result.get('thread_id')
-                conversation_id = generated_result.get('conversation_id')
+                if not thread_id or not conversation_id:
+                    raise Exception("대화 생성 실패: ID 정보가 없습니다")
                 
                 # 마지막 응답을 더 안정적으로 전송하기 위한 지연 및 분할
                 time.sleep(0.5)  # 마지막 응답 전 더 긴 지연

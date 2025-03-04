@@ -13,7 +13,7 @@ class Database:
                 database=Config.DB_NAME,
                 port=3306,  # MySQL 기본 포트
                 connect_timeout=10,  # 연결 타임아웃 10초
-                time_zone='+09:00'  # KST (UTC+9) 설정
+                # time_zone='+09:00'  # KST (UTC+9) 설정
             )
             
             # 세션 타임존 설정
@@ -79,17 +79,20 @@ class Database:
         self.connection = self.get_connection()
         if self.connection:
             self.cursor = self.connection.cursor(dictionary=True)
-            return self.cursor
+            return self
         raise Exception("Database connection failed")
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            if self.connection:
+                self.connection.rollback()
+        else:
+            if self.connection:
+                self.connection.commit()
+        
         if self.cursor:
             self.cursor.close()
         if self.connection:
-            if exc_type is None:
-                self.connection.commit()
-            else:
-                self.connection.rollback()
             self.connection.close()
 
     @staticmethod
@@ -144,4 +147,22 @@ class Database:
             (thread_id,)
         )
         next_id = cursor.fetchone()['next_id'] or 1
-        return next_id 
+        return next_id
+
+    def execute(self, query, params=None):
+        try:
+            self.cursor.execute(query, params)
+            return self.cursor
+        except mysql.connector.Error as err:
+            print(f"Database error: {err}")
+            raise
+
+    @property
+    def lastrowid(self):
+        return self.cursor.lastrowid
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        return self.cursor.fetchall() 

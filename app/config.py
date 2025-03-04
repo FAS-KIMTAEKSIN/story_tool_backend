@@ -5,7 +5,8 @@ load_dotenv()
 
 class Config:
     EMBEDDING_MODEL = 'text-embedding-3-small'
-    GPT_MODEL = "gpt-4o-mini-2024-07-18"
+    GPT_MINI_MODEL = "gpt-4o-mini-2024-07-18"
+    GPT_4O_MODEL = "gpt-4o-2024-11-20"
     FINE_TUNED_MODEL = "ft:gpt-4o-mini-2024-07-18:fasolution::B1wUqLKD"
     MAX_WORKERS = 4
     
@@ -81,3 +82,6 @@ class Config:
 
 결과물은 하나의 이야기로 작성해주세요.
 """
+
+    # Assistant ID 설정 (최초 생성 후 재사용)
+    GPT4O_ASSISTANT_ID = os.getenv('GPT4O_ASSISTANT_ID', '')

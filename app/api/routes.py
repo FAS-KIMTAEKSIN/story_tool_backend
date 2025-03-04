@@ -65,11 +65,28 @@ def generate_story():
         if not data:
             return jsonify({"error": "데이터가 제공되지 않았습니다"}), 400
 
+        # 임시 사용자 ID 가져오기
+        user_id = data.get('user_id') or Database.get_or_create_temp_user()
+        if user_id is None:
+            return jsonify({"error": "사용자를 처리할 수 없습니다"}), 500
+            
+        # 사용자 ID 설정
+        data['user_id'] = user_id
+            
         def generate():
             try:
-                story_generator = StoryService.hybrid_generate_story(data)
+                # thread_id와 conversation_id가 제공된 경우 그대로 사용
+                thread_id = data.get('thread_id')
+                conversation_id = data.get('conversation_id')
+                
+                if thread_id and conversation_id:
+                    print(f"[DEBUG] Using provided thread_id={thread_id}, conversation_id={conversation_id}")
+                
+                story_generator = StoryService.hybrid_generate_story_with_assistant(data)
                 final_content = None
                 generated_result = None
+                recommendations = None
+                openai_thread_id = None
                 
                 for message in story_generator:
                     yield message  # 이미 SSE 형식으로 포맷팅된 메시지
@@ -77,59 +94,43 @@ def generate_story():
                     # JSON 파싱하여 최종 결과 확인
                     try:
                         parsed = json.loads(message.replace('data: ', ''))
+                        
+                        # 생성된 대화 정보 캡처
+                        if 'conversation_created' in parsed.get('msg', ''):
+                            thread_id = parsed.get('thread_id')
+                            conversation_id = parsed.get('conversation_id')
+                            
+                        # 최종 결과 캡처
                         if 'created_content' in parsed:
                             generated_result = parsed
                             final_content = parsed['created_content']
+                            recommendations = parsed.get('recommendations', ["", "", ""])
+                            openai_thread_id = parsed.get('openai_thread_id')
+                            thread_id = parsed.get('thread_id', thread_id)
+                            conversation_id = parsed.get('conversation_id', conversation_id)
                     except:
                         continue
 
-                if not generated_result or not final_content:
-                    raise Exception("이야기 생성 실패: 결과가 비어있음")
-                
-                # 결과 포맷팅
-                result = {
-                    "user_input": data.get('user_input', ''),
-                    "tags": data.get('tags', {}),
-                    "created_title": generated_result['created_title'],
-                    "created_content": final_content,
-                    "similar_1": {},
-                    "similar_2": {},
-                    "similar_3": {},
-                    "recommended_1": "",
-                    "recommended_2": "",
-                    "recommended_3": ""
-                }
-                
-                # 임시 사용자 ID 가져오기
-                user_id = Database.get_or_create_temp_user()
-                if user_id is None:
-                    raise Exception("Failed to handle user")
-                    
-                # DB에 저장
-                thread_id, conversation_id = StoryService.save_to_database(user_id, data, result)
-                if thread_id is None or conversation_id is None:
-                    raise Exception("Failed to save to database")
-                
-                # 최종 결과 전송 - 더 긴 지연 추가
-                final_result = {
-                    "success": True,
-                    "result": result,
-                    "thread_id": thread_id,
-                    "conversation_id": conversation_id,
-                    "user_id": user_id
-                }
+                if not thread_id or not conversation_id:
+                    raise Exception("대화 생성 실패: ID 정보가 없습니다")
                 
                 # 마지막 응답을 더 안정적으로 전송하기 위한 지연 및 분할
                 time.sleep(0.5)  # 마지막 응답 전 더 긴 지연
-                
-                # 마지막 응답을 더 작은 청크로 분할하여 전송
-                final_json = json.dumps(final_result, ensure_ascii=False)
                 
                 # 마지막 응답 전에 완료 신호 전송
                 yield "data: {\"msg\": \"completion_pending\"}\n\n"
                 time.sleep(0.2)
                 
                 # 최종 응답 전송
+                final_result = {
+                    "success": True,
+                    "thread_id": thread_id,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "openai_thread_id": openai_thread_id
+                }
+                
+                final_json = json.dumps(final_result, ensure_ascii=False)
                 yield f"data: {final_json}\n\n"
                 
             except Exception as e:

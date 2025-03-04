@@ -302,19 +302,19 @@ class HistoryService:
             cursor.execute("""
                 SELECT 
                     t.thread_id,
-                    t.created_at as thread_created_at,
-                    t.updated_at as thread_updated_at,
-                    c.conversation_id,
+                    t.title,
+                    CONVERT_TZ(t.created_at, '+00:00', '+09:00') as thread_created_at,
+                    CONVERT_TZ(t.updated_at, '+00:00', '+09:00') as thread_updated_at,
+                    COALESCE(c.conversation_id, 1) as conversation_id,
                     MAX(CASE WHEN cd.category = 'user_input' THEN cd.data END) as user_input,
-                    MAX(CASE WHEN cd.category = 'created_title' THEN cd.data END) as title,
                     MAX(CASE WHEN cd.category = 'created_content' THEN cd.data END) as content
                 FROM threads t
-                JOIN conversations c ON t.thread_id = c.thread_id
-                JOIN conversation_data cd ON c.thread_id = cd.thread_id 
+                LEFT JOIN conversations c ON t.thread_id = c.thread_id AND c.conversation_id = 1
+                LEFT JOIN conversation_data cd ON c.thread_id = cd.thread_id 
                     AND c.conversation_id = cd.conversation_id
                 WHERE t.user_id = %s
-                GROUP BY t.thread_id, c.conversation_id
-                ORDER BY t.updated_at DESC, c.conversation_id DESC
+                GROUP BY t.thread_id, t.title, t.created_at, t.updated_at, c.conversation_id
+                ORDER BY COALESCE(t.updated_at, t.created_at) DESC, t.thread_id DESC
             """, (user_id,))
             
             rows = cursor.fetchall()

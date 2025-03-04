@@ -8,6 +8,7 @@ from app.config import Config
 from app.services.story_service import StoryService
 import os
 import traceback
+from app.utils.database import Database
 
 class SearchService:
     client = OpenAI()
@@ -80,7 +81,7 @@ class SearchService:
 
         try:
             response = cls.client.chat.completions.create(
-                model=Config.GPT_MODEL,
+                model=Config.GPT_MINI_MODEL,  # GPT_MODEL 대신 GPT_MINI_MODEL 사용
                 messages=messages,
                 temperature=0.3,
                 max_tokens=200
@@ -195,19 +196,31 @@ class SearchService:
             # 검색 수행
             search_results = cls.search_documents(data)
             
-            # 추천 생성
+            # 추천은 이미 /generate에서 생성되어 DB에 저장되어 있으므로
+            # 여기서는 DB에서 가져오기만 하고 새로 생성하지 않음
             recommendations = []
-            if search_results:
-                for result in search_results[:3]:  # 상위 3개 결과에 대해
-                    recommendation = StoryService.generate_recommendation(
-                        result.get('metadata', {}).get('주제문', '')
-                    )
-                    if recommendation:
-                        recommendations.append(recommendation)
+            try:
+                thread_id = data.get('thread_id')
+                conversation_id = data.get('conversation_id')
+                
+                if thread_id and conversation_id:
+                    with Database() as cursor:
+                        cursor.execute(
+                            """SELECT category, data FROM conversation_data 
+                               WHERE thread_id = %s AND conversation_id = %s 
+                               AND category IN ('recommended_1', 'recommended_2', 'recommended_3')
+                               ORDER BY category""",
+                            (thread_id, conversation_id)
+                        )
+                        
+                        for row in cursor.fetchall():
+                            recommendations.append(row['data'])
+            except Exception as e:
+                print(f"[ERROR] Failed to retrieve recommendations: {str(e)}")
             
             return {
                 'search_results': search_results[:3] if search_results else [],
-                'recommendations': recommendations[:3] if recommendations else []
+                'recommendations': recommendations[:3] if recommendations else ["", "", ""]
             }
             
         except Exception as e:
@@ -215,5 +228,5 @@ class SearchService:
             print(f"[ERROR] {traceback.format_exc()}")
             return {
                 'search_results': [],
-                'recommendations': []
+                'recommendations': ["", "", ""]
             } 

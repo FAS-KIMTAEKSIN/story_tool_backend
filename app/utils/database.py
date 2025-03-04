@@ -13,7 +13,7 @@ class Database:
                 database=Config.DB_NAME,
                 port=3306,  # MySQL 기본 포트
                 connect_timeout=10,  # 연결 타임아웃 10초
-                time_zone='+09:00'  # KST (UTC+9) 설정
+                # time_zone='+09:00'  # KST (UTC+9) 설정
             )
             
             # 세션 타임존 설정

@@ -303,8 +303,8 @@ class HistoryService:
                 SELECT 
                     t.thread_id,
                     t.title,
-                    CONVERT_TZ(t.created_at, '+00:00', '+09:00') as thread_created_at,
-                    CONVERT_TZ(t.updated_at, '+00:00', '+09:00') as thread_updated_at,
+                    t.created_at as thread_created_at,
+                    t.updated_at as thread_updated_at,
                     COALESCE(c.conversation_id, 1) as conversation_id,
                     MAX(CASE WHEN cd.category = 'user_input' THEN cd.data END) as user_input,
                     MAX(CASE WHEN cd.category = 'created_content' THEN cd.data END) as content

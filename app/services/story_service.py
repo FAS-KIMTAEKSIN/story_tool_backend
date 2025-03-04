@@ -7,7 +7,7 @@ import traceback
 import time
 import requests
 import logging
-from typing import Optional, Dict, Any, Generator
+from typing import Optional, Dict, Any, Generator, List
 
 # 로깅 설정
 logging.basicConfig(level=logging.DEBUG)
@@ -340,10 +340,231 @@ class StoryGenerator:
 class StoryService:
     """전체 스토리 서비스를 관리하는 메인 클래스"""
     
+    _search_cache = {}  # 검색 결과 캐시
+    
     @classmethod
     def initialize(cls) -> bool:
         """서비스 초기화"""
         return OpenAIAssistantManager.initialize_assistant()
+
+    @classmethod
+    def search_stories(cls, query: str, page: int = 1, per_page: int = 10) -> Dict[str, Any]:
+        """이야기 검색"""
+        try:
+            with Database() as db:
+                # 전체 결과 수 조회
+                db.execute(
+                    """SELECT COUNT(*) as total FROM threads t
+                       JOIN conversation_data cd ON t.id = cd.thread_id
+                       WHERE cd.category IN ('created_title', 'created_content')
+                       AND (cd.data LIKE %s OR t.title LIKE %s)""",
+                    (f"%{query}%", f"%{query}%")
+                )
+                total = db.fetchone()['total']
+
+                # 페이지네이션된 결과 조회
+                offset = (page - 1) * per_page
+                db.execute(
+                    """SELECT DISTINCT t.id, t.title, t.user_id,
+                       MAX(CASE WHEN cd.category = 'created_content' THEN cd.data END) as content,
+                       MAX(cd.conversation_id) as latest_conversation_id
+                       FROM threads t
+                       JOIN conversation_data cd ON t.id = cd.thread_id
+                       WHERE cd.category IN ('created_title', 'created_content')
+                       AND (cd.data LIKE %s OR t.title LIKE %s)
+                       GROUP BY t.id, t.title, t.user_id
+                       ORDER BY t.id DESC
+                       LIMIT %s OFFSET %s""",
+                    (f"%{query}%", f"%{query}%", per_page, offset)
+                )
+                results = db.fetchall()
+
+                search_results = {
+                    'total': total,
+                    'page': page,
+                    'per_page': per_page,
+                    'total_pages': (total + per_page - 1) // per_page,
+                    'results': results
+                }
+
+                # 검색 결과 캐시 업데이트
+                cls.update_search_results(query, search_results)
+                return search_results
+
+        except Exception as e:
+            logger.error(f"Search failed: {str(e)}", exc_info=True)
+            raise
+
+    @classmethod
+    def search_and_recommend(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        """검색 및 추천 결과 조회"""
+        try:
+            # 필수 파라미터 검증
+            thread_id = data.get('thread_id')
+            conversation_id = data.get('conversation_id')
+            user_id = data.get('user_id')
+            user_input = data.get('user_input', '')
+            tags = data.get('tags', {})
+
+            if not all([thread_id, conversation_id, user_id]):
+                raise ValueError("Required parameters missing")
+
+            with Database() as db:
+                # 소유권 확인
+                db.execute(
+                    """SELECT 1 FROM threads t 
+                       JOIN conversations c ON t.id = c.thread_id 
+                       WHERE t.id = %s AND c.conversation_id = %s AND t.user_id = %s""",
+                    (thread_id, conversation_id, user_id)
+                )
+                if not db.fetchone():
+                    raise ValueError("Invalid thread_id, conversation_id, or unauthorized access")
+
+                # 유사한 문서 검색
+                search_results = []
+                db.execute(
+                    """SELECT DISTINCT t.id, t.title, cd.data as content
+                       FROM threads t
+                       JOIN conversation_data cd ON t.id = cd.thread_id
+                       WHERE cd.category = 'created_content'
+                       AND (t.title LIKE %s OR cd.data LIKE %s)
+                       AND t.id != %s
+                       LIMIT 3""",
+                    (f"%{user_input}%", f"%{user_input}%", thread_id)
+                )
+                results = db.fetchall()
+                
+                # 검색 결과 처리
+                for idx, result in enumerate(results or [], 1):
+                    try:
+                        search_results.append({
+                            'document_id': idx,
+                            'metadata': {
+                                'id': result.get('id', 0),
+                                'title': result.get('title', '제목 없음')
+                            },
+                            'content': result.get('content', ''),
+                            'score': 1.0 - (idx * 0.1)  # 간단한 점수 계산
+                        })
+                    except Exception as e:
+                        logger.error(f"Error processing search result: {str(e)}", exc_info=True)
+                        continue
+
+                # 임시 추천 문서 생성
+                recommendations = [
+                    f"추천 {i+1}: {user_input}와(과) 비슷한 이야기"
+                    for i in range(3)
+                ]
+
+                # 결과를 클라이언트가 기대하는 형식으로 구성
+                formatted_result = {
+                    "success": True,
+                    "result": {
+                        "similar_1": search_results[0] if len(search_results) > 0 else {},
+                        "similar_2": search_results[1] if len(search_results) > 1 else {},
+                        "similar_3": search_results[2] if len(search_results) > 2 else {},
+                        "recommended_1": recommendations[0] if len(recommendations) > 0 else "",
+                        "recommended_2": recommendations[1] if len(recommendations) > 1 else "",
+                        "recommended_3": recommendations[2] if len(recommendations) > 2 else ""
+                    }
+                }
+
+                # 검색 결과 업데이트
+                try:
+                    cls.update_search_results(
+                        thread_id=thread_id,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        search_results=search_results,
+                        recommendations=recommendations
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to update search results: {str(e)}", exc_info=True)
+                    # 업데이트 실패해도 검색 결과는 반환
+
+                return formatted_result
+
+        except Exception as e:
+            logger.error(f"Search and recommend failed: {str(e)}", exc_info=True)
+            return {
+                "success": False,
+                "result": {
+                    "similar_1": {},
+                    "similar_2": {},
+                    "similar_3": {},
+                    "recommended_1": "",
+                    "recommended_2": "",
+                    "recommended_3": ""
+                }
+            }
+
+    @classmethod
+    def update_search_results(cls, thread_id: str, conversation_id: str, user_id: int,
+                            search_results: List[Dict[str, Any]], recommendations: List[str]) -> Dict[str, bool]:
+        """검색 결과 업데이트"""
+        try:
+            with Database() as db:
+                db.connection.start_transaction()
+                try:
+                    # 소유권 확인
+                    db.execute(
+                        """SELECT 1 FROM threads t 
+                           JOIN conversations c ON t.id = c.thread_id 
+                           WHERE t.id = %s AND c.conversation_id = %s AND t.user_id = %s""",
+                        (thread_id, conversation_id, user_id)
+                    )
+                    if not db.fetchone():
+                        raise Exception("Invalid thread_id, conversation_id, or unauthorized access")
+
+                    # 검색 결과 업데이트
+                    for idx, category in enumerate(['similar_1', 'similar_2', 'similar_3'], 1):
+                        result = search_results[idx-1] if idx <= len(search_results) else {}
+                        db.execute(
+                            """INSERT INTO conversation_data 
+                               (thread_id, conversation_id, category, data)
+                               VALUES (%s, %s, %s, %s)
+                               ON DUPLICATE KEY UPDATE data = VALUES(data)""",
+                            (thread_id, conversation_id, category, 
+                             json.dumps(result, ensure_ascii=False))
+                        )
+
+                    # 추천 문서 업데이트
+                    for idx, category in enumerate(['recommended_1', 'recommended_2', 'recommended_3'], 1):
+                        recommendation = recommendations[idx-1] if idx <= len(recommendations) else ""
+                        db.execute(
+                            """INSERT INTO conversation_data 
+                               (thread_id, conversation_id, category, data)
+                               VALUES (%s, %s, %s, %s)
+                               ON DUPLICATE KEY UPDATE data = VALUES(data)""",
+                            (thread_id, conversation_id, category, recommendation)
+                        )
+
+                    db.connection.commit()
+                    logger.info(f"Successfully updated search results for thread_id: {thread_id}, conversation_id: {conversation_id}, user_id: {user_id}")
+                    return {"success": True}
+
+                except Exception as e:
+                    db.connection.rollback()
+                    logger.error(f"Database transaction failed: {str(e)}", exc_info=True)
+                    raise
+
+        except Exception as e:
+            logger.error(f"Failed to update search results: {str(e)}", exc_info=True)
+            return {"success": False}
+
+    @classmethod
+    def get_search_results(cls, query: str, thread_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """캐시된 검색 결과 조회"""
+        cache_key = f"{query}_{thread_id}" if thread_id else query
+        cache_data = cls._search_cache.get(cache_key)
+        if cache_data and time.time() - cache_data['timestamp'] < 300:  # 5분 캐시
+            return cache_data['results']
+        return None
+
+    @classmethod
+    def clear_search_cache(cls) -> None:
+        """검색 결과 캐시 초기화"""
+        cls._search_cache.clear()
 
     @classmethod
     def hybrid_generate_story_with_assistant(cls, data: Dict[str, Any]) -> Generator:

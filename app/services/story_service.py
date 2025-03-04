@@ -10,8 +10,15 @@ import logging
 from typing import Optional, Dict, Any, Generator
 
 # 로깅 설정
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+# 스트림 핸들러 추가
+stream_handler = logging.StreamHandler()
+stream_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
 
 # OpenAI 클라이언트 싱글톤
 openai_client = OpenAI()
@@ -158,6 +165,30 @@ class OpenAIAssistantManager:
 class StoryGenerator:
     """이야기 생성을 담당하는 클래스"""
 
+    @staticmethod
+    def _extract_message_content(message) -> Optional[str]:
+        """메시지에서 안전하게 텍스트 내용을 추출"""
+        try:
+            logger.debug(f"Message object structure: {message}")
+            logger.debug(f"Message content type: {type(message.content)}")
+            
+            if not message.content or len(message.content) == 0:
+                logger.warning(f"Message content is empty or None: {message.content}")
+                return None
+            
+            logger.debug(f"Message content length: {len(message.content)}")
+            for i, content in enumerate(message.content):
+                logger.debug(f"Content {i} type: {type(content)}")
+                logger.debug(f"Content {i} structure: {content}")
+                if hasattr(content, 'text') and hasattr(content.text, 'value'):
+                    return content.text.value
+            
+            logger.warning("No text content found in message")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to extract message content: {str(e)}", exc_info=True)
+            return None
+
     @classmethod
     def generate_story_and_title(cls, user_input: str, 
                                existing_thread_id: Optional[str] = None) -> Generator:
@@ -195,41 +226,79 @@ class StoryGenerator:
     def _expand_story(cls, base_story: str, thread_id: str) -> Generator:
         """GPT-4를 사용한 이야기 확장"""
         try:
-            openai_client.beta.threads.messages.create(
-                thread_id=thread_id,
-                role="user",
-                content=base_story
-            )
+            logger.info("=== Story Expansion Started ===")
+            logger.info(f"Thread ID: {thread_id}")
+            logger.info(f"Base story length: {len(base_story)}")
             
-            run = openai_client.beta.threads.runs.create(
-                thread_id=thread_id,
-                assistant_id=OpenAIAssistantManager.gpt4o_assistant.id
-            )
-            
-            start_time = time.time()
-            
-            while time.time() - start_time < OpenAIAssistantManager.TIMEOUT:
-                run_status = openai_client.beta.threads.runs.retrieve(
+            # 사용자 메시지 전송
+            logger.info("Creating user message...")
+            try:
+                user_message = openai_client.beta.threads.messages.create(
                     thread_id=thread_id,
-                    run_id=run.id
+                    role="user",
+                    content=base_story
                 )
-                
-                if run_status.status == 'completed':
-                    messages = openai_client.beta.threads.messages.list(thread_id=thread_id)
-                    for message in messages.data:
-                        if message.role == "assistant":
-                            yield message.content[0].text.value
-                            return
-                            
-                elif run_status.status in ['failed', 'cancelled', 'expired']:
-                    raise Exception(f"Story expansion failed: {run_status.status}")
-                
-                time.sleep(1)
+                logger.info(f"User message created successfully: {user_message.id}")
+            except Exception as e:
+                logger.error("Failed to create user message", exc_info=True)
+                raise
             
-            raise Exception("Story expansion timed out")
+            # 실행 시작 (스트리밍 모드)
+            logger.info("Creating assistant run with streaming...")
+            try:
+                stream = openai_client.beta.threads.runs.create(
+                    thread_id=thread_id,
+                    assistant_id=OpenAIAssistantManager.gpt4o_assistant.id,
+                    stream=True
+                )
+                logger.info("Stream created successfully")
+            except Exception as e:
+                logger.error("Failed to create stream", exc_info=True)
+                raise
+            
+            current_content = ""
+            message_id = None
+            
+            # 스트리밍 이벤트 처리
+            for event in stream:
+                event_type = getattr(event, 'event', None)
+                logger.debug(f"Received event: {event_type}")
                 
+                if event_type == 'thread.message.delta':
+                    delta = event.data.delta
+                    if delta.content and len(delta.content) > 0:
+                        content_item = delta.content[0]
+                        if hasattr(content_item, 'text') and hasattr(content_item.text, 'value'):
+                            text_value = content_item.text.value
+                            current_content += text_value
+                            logger.info(f"Received content chunk (length: {len(text_value)})")
+                            yield text_value
+                
+                elif event_type == 'thread.message.completed':
+                    if not message_id:
+                        message_id = event.data.id
+                        logger.info(f"Message completed: {message_id}")
+                
+                elif event_type == 'thread.run.completed':
+                    logger.info("Run completed successfully")
+                    if not current_content:
+                        logger.error("No content generated during story expansion")
+                        raise Exception("이야기 생성에 실패했습니다: 내용이 비어있습니다")
+                    return
+                
+                elif event_type == 'thread.run.failed':
+                    error_msg = getattr(event.data, 'last_error', 'Unknown error')
+                    logger.error(f"Run failed: {error_msg}")
+                    raise Exception(f"Story expansion failed: {error_msg}")
+            
+            if not current_content:
+                logger.error("No content generated during story expansion")
+                raise Exception("이야기 생성에 실패했습니다: 내용이 비어있습니다")
+            
+            logger.info("=== Story Expansion Completed Successfully ===")
+            
         except Exception as e:
-            logger.error(f"Failed to expand story: {str(e)}", exc_info=True)
+            logger.error(f"Story expansion failed: {str(e)}", exc_info=True)
             raise
 
     @classmethod

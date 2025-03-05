@@ -295,7 +295,6 @@ class HistoryService:
 
     @classmethod
     def get_chat_history_list(cls, user_id: int) -> dict:
-        """사용자의 전체 대화 목록을 조회합니다"""
         connection = Database.get_connection()
         if not connection:
             return {"success": False, "error": "Database connection failed"}
@@ -355,43 +354,6 @@ class HistoryService:
                 connection.close()
 
     @classmethod
-    def delete_thread(cls, thread_id: int, user_id: int) -> dict:
-        """사용자의 대화 쓰레드를 삭제합니다"""
-        connection = Database.get_connection()
-        if not connection:
-            return {"success": False, "error": "Database connection failed"}
-
-        try:
-            cursor = connection.cursor(dictionary=True)
-            
-            # 쓰레드 소유권 확인
-            if not cls.verify_thread_ownership(cursor, thread_id, user_id):
-                return {"success": False, "error": "Invalid thread_id or unauthorized"}
-            
-            # 쓰레드 삭제 (CASCADE로 인해 관련된 conversations와 conversation_data도 자동 삭제됨)
-            cursor.execute(
-                "DELETE FROM threads WHERE thread_id = %s AND user_id = %s",
-                (thread_id, user_id)
-            )
-            
-            if cursor.rowcount == 0:
-                return {"success": False, "error": "Thread not found or already deleted"}
-            
-            connection.commit()
-            return {"success": True}
-            
-        except Error as e:
-            print(f"Database error: {str(e)}")
-            if connection:
-                connection.rollback()
-            return {"success": False, "error": f"Database error: {str(e)}"}
-            
-        finally:
-            if connection and connection.is_connected():
-                cursor.close()
-                connection.close()
-
-    @classmethod
     def update_thread_title(cls, thread_id: int, user_id: int, title: str) -> dict:
         """쓰레드의 제목을 업데이트합니다"""
         if not title or not title.strip():
@@ -429,4 +391,53 @@ class HistoryService:
         finally:
             if connection and connection.is_connected():
                 cursor.close()
-                connection.close() 
+                connection.close()
+
+    @classmethod
+    def delete_thread(cls, thread_id: int, user_id: int) -> dict:
+        """데이터베이스에서 쓰레드를 삭제하고 OpenAI 쓰레드 ID를 반환합니다"""
+        try:
+            with Database() as db:
+                db.connection.start_transaction()
+                
+                # 쓰레드 정보 조회 및 소유권 확인
+                db.execute(
+                    "SELECT thread_id as openai_thread_id, title FROM threads WHERE id = %s AND user_id = %s",
+                    (thread_id, user_id)
+                )
+                result = db.cursor.fetchone()
+                
+                if not result:
+                    return {
+                        "success": False, 
+                        "error": "Invalid thread_id or unauthorized"
+                    }
+                
+                openai_thread_id = result['openai_thread_id']
+                
+                # 데이터베이스에서 쓰레드 삭제
+                db.execute(
+                    "DELETE FROM threads WHERE id = %s AND user_id = %s",
+                    (thread_id, user_id)
+                )
+                
+                if db.cursor.rowcount == 0:
+                    db.connection.rollback()
+                    return {
+                        "success": False,
+                        "error": "Failed to delete thread from database"
+                    }
+                
+                db.connection.commit()
+                return {
+                    "success": True,
+                    "openai_thread_id": openai_thread_id
+                }
+                
+        except Exception as e:
+            if 'db' in locals() and hasattr(db, 'connection'):
+                db.connection.rollback()
+            return {
+                "success": False,
+                "error": f"Database error: {str(e)}"
+            } 

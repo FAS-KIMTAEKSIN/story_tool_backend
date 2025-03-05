@@ -8,6 +8,7 @@ import time
 import requests
 import logging
 from typing import Optional, Dict, Any, Generator, List
+from app.services.history_service import HistoryService
 
 # 로깅 설정
 logging.basicConfig(level=logging.DEBUG)
@@ -668,3 +669,41 @@ class StoryService:
             logger.error(f"Story generation failed: {str(e)}", 
                         extra={"request_id": request_id}, exc_info=True)
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+    @classmethod
+    def delete_thread(cls, thread_id: int, user_id: int) -> dict:
+        """사용자의 대화 쓰레드를 삭제합니다"""
+        try:
+            # HistoryService를 통해 데이터베이스 작업 수행
+            result = HistoryService.delete_thread(thread_id, user_id)
+            if not result["success"]:
+                return result
+            
+            openai_thread_id = result["openai_thread_id"]
+            
+            # OpenAI 쓰레드 ID 형식 검증
+            if not isinstance(openai_thread_id, str):
+                logger.error(f"OpenAI thread ID is not a string: {openai_thread_id}")
+                return {"success": False, "error": "Invalid OpenAI thread ID format"}
+            
+            if not openai_thread_id.startswith('thread_'):
+                logger.error(f"Invalid OpenAI thread ID format: {openai_thread_id}")
+                return {"success": False, "error": "Invalid OpenAI thread ID format"}
+            
+            # OpenAI 쓰레드 삭제
+            try:
+                response = openai_client.beta.threads.delete(openai_thread_id)
+                if not hasattr(response, 'deleted') or not response.deleted:
+                    logger.error(f"OpenAI thread deletion failed - Response: {response}")
+                    return {"success": False, "error": "OpenAI thread deletion failed"}
+                    
+                logger.info(f"Successfully deleted OpenAI thread: {openai_thread_id}")
+                return {"success": True}
+                
+            except Exception as api_error:
+                logger.error(f"OpenAI API error: {str(api_error)}", exc_info=True)
+                return {"success": False, "error": f"OpenAI API error: {str(api_error)}"}
+                
+        except Exception as e:
+            logger.error(f"Unexpected error during thread deletion: {str(e)}", exc_info=True)
+            return {"success": False, "error": f"Unexpected error: {str(e)}"}

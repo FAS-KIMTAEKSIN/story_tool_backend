@@ -580,16 +580,31 @@ class StoryService:
             
             existing_db_thread_id = data.get('thread_id')
             thread_id = existing_db_thread_id
+            existing_openai_thread_id = None
             
-            # 새 thread 생성
+            # 기존 thread의 openai_thread_id 조회
+            if thread_id is not None:
+                with Database() as db:
+                    db.execute(
+                        "SELECT thread_id FROM threads WHERE id = %s",
+                        (thread_id,)
+                    )
+                    result = db.fetchone()
+                    if result:
+                        existing_openai_thread_id = result['thread_id']
+                        logger.info(f"Found existing OpenAI thread ID: {existing_openai_thread_id}")
+            
+            # 새 thread 생성 또는 기존 thread 사용
             if thread_id is None:
                 openai_thread_id = OpenAIAssistantManager.create_or_get_thread()
                 thread_id = ThreadManager.create_thread(user_id, "새 이야기", openai_thread_id)
+            else:
+                openai_thread_id = OpenAIAssistantManager.create_or_get_thread(existing_openai_thread_id)
             
             # 이야기 생성
             for result in StoryGenerator.generate_story_and_title(
                 data.get('user_input', ''),
-                OpenAIAssistantManager.current_openai_thread_id
+                openai_thread_id
             ):
                 if result["msg"] == "completed":
                     story_data = result["content"]
@@ -635,11 +650,9 @@ class StoryService:
                                 "recommendations": story_data["recommendations"],
                                 "thread_id": thread_id,
                                 "conversation_id": conversation_id,
-                                "user_id": user_id
+                                "user_id": user_id,
+                                "openai_thread_id": openai_thread_id
                             }
-                            
-                            if existing_db_thread_id is None:
-                                response["openai_thread_id"] = OpenAIAssistantManager.current_openai_thread_id
                             
                             yield f"data: {json.dumps(response, ensure_ascii=False)}\n\n"
                             

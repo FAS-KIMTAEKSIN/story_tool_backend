@@ -434,7 +434,7 @@ def delete_thread():
         if not thread_id or not user_id:
             return jsonify({"error": "thread_id와 user_id가 필요합니다"}), 400
             
-        result = HistoryService.delete_thread(thread_id, user_id)
+        result = StoryService.delete_thread(thread_id, user_id)
         
         if result['success']:
             return jsonify(result)

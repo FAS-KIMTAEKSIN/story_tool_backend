@@ -144,7 +144,7 @@ class HistoryService:
     def verify_thread_ownership(cls, cursor, thread_id: int, user_id: int) -> bool:
         """스레드의 소유권을 확인합니다"""
         cursor.execute(
-            "SELECT 1 FROM threads WHERE thread_id = %s AND user_id = %s",
+            "SELECT 1 FROM threads WHERE id = %s AND user_id = %s",
             (thread_id, user_id)
         )
         return bool(cursor.fetchone())
@@ -203,7 +203,10 @@ class HistoryService:
                 return {"success": False, "error": "No conversations found"}
             
             conversations = {}
+            openai_thread_id = None
             for row in rows:
+                if openai_thread_id is None:
+                    openai_thread_id = row['openai_thread_id']
                 cls.process_conversation_data(conversations, row)
             
             conversation_list = list(conversations.values())
@@ -215,6 +218,7 @@ class HistoryService:
                         "success": True,
                         "result": conv,
                         "thread_id": thread_id,
+                        "openai_thread_id": openai_thread_id,
                         "conversation_id": conv['conversation_id'],
                         "user_id": user_id
                     } for conv in conversation_list
@@ -278,13 +282,14 @@ class HistoryService:
             SELECT 
                 c.conversation_id,
                 cd.category,
-                cd.data
+                cd.data,
+                t.thread_id as openai_thread_id
             FROM conversations c
             JOIN conversation_data cd 
                 ON c.thread_id = cd.thread_id 
                 AND c.conversation_id = cd.conversation_id
-            JOIN threads t ON c.thread_id = t.thread_id
-            WHERE c.thread_id = %s
+            JOIN threads t ON c.thread_id = t.id
+            WHERE t.id = %s
             ORDER BY c.conversation_id ASC, cd.category
         """
 
@@ -301,7 +306,7 @@ class HistoryService:
             # 사용자의 모든 대화 목록 조회
             cursor.execute("""
                 SELECT 
-                    t.thread_id,
+                    t.id as thread_id,
                     t.title,
                     t.created_at as thread_created_at,
                     t.updated_at as thread_updated_at,
@@ -309,12 +314,12 @@ class HistoryService:
                     MAX(CASE WHEN cd.category = 'user_input' THEN cd.data END) as user_input,
                     MAX(CASE WHEN cd.category = 'created_content' THEN cd.data END) as content
                 FROM threads t
-                LEFT JOIN conversations c ON t.thread_id = c.thread_id AND c.conversation_id = 1
+                LEFT JOIN conversations c ON t.id = c.thread_id AND c.conversation_id = 1
                 LEFT JOIN conversation_data cd ON c.thread_id = cd.thread_id 
                     AND c.conversation_id = cd.conversation_id
                 WHERE t.user_id = %s
-                GROUP BY t.thread_id, t.title, t.created_at, t.updated_at, c.conversation_id
-                ORDER BY COALESCE(t.updated_at, t.created_at) DESC, t.thread_id DESC
+                GROUP BY t.id, t.title, t.created_at, t.updated_at, c.conversation_id
+                ORDER BY COALESCE(t.updated_at, t.created_at) DESC, t.id DESC
             """, (user_id,))
             
             rows = cursor.fetchall()

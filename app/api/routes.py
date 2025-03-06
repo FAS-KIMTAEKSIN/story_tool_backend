@@ -468,3 +468,27 @@ def update_thread_title():
             
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@api_bp.route('/cancelGeneration', methods=['POST'])
+@log_request_response
+def cancel_generation():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "데이터가 제공되지 않았습니다"}), 400
+            
+        thread_id = data.get('thread_id')
+        conversation_id = data.get('conversation_id')
+        
+        if not all([thread_id, conversation_id]):
+            return jsonify({"error": "필수 파라미터가 누락되었습니다"}), 400
+            
+        result = StoryService.cancel_generation(thread_id, conversation_id)
+        
+        if result.get("success"):
+            return jsonify(result)
+        else:
+            return jsonify({"error": result.get("error", "이야기 생성 중단에 실패했습니다")}), 500
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

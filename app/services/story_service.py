@@ -987,7 +987,7 @@ class StoryService:
                     return {"success": False, "error": "OpenAI thread deletion failed"}
                     
                 logger.info(f"Successfully deleted OpenAI thread: {openai_thread_id}")
-                return {"success": True}
+                return {"success": True, "status": 200}
                 
             except Exception as api_error:
                 logger.error(f"OpenAI API error: {str(api_error)}", exc_info=True)

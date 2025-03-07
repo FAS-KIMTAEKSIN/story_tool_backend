@@ -369,7 +369,7 @@ class StoryGenerator:
                 # 스트리밍 이벤트 처리
                 for event in stream:
                     event_type = getattr(event, 'event', None)
-                    logger.debug(f"Received event: {event_type}")
+                    # logger.debug(f"Received event: {event_type}")
                     
                     if event_type == 'thread.run.created':
                         run_id = event.data.id
@@ -387,7 +387,7 @@ class StoryGenerator:
                             if hasattr(content_item, 'text') and hasattr(content_item.text, 'value'):
                                 text_value = content_item.text.value
                                 current_content += text_value
-                                logger.info(f"Received content chunk (length: {len(text_value)})")
+                                # logger.info(f"Received content chunk (length: {len(text_value)})")
                                 
                                 # 각 청크마다 취소 상태 확인
                                 if StoryService._cancellation_flags.get(f"{thread_id}_{run_id}", False):
@@ -819,10 +819,38 @@ class StoryService:
             conversation_id = ConversationManager.create_conversation(thread_id)
             cancellation_key = f"{thread_id}_{conversation_id}"
             cls._cancellation_flags[cancellation_key] = False
-            
-            # 이야기 생성
+
+            # FINE_TUNING_MODEL로 base_story 생성
+            logger.info("Generating base story with fine-tuned model")
+            base_story = ""
+            try:
+                response = openai_client.chat.completions.create(
+                    model=Config.FINE_TUNED_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": Config.STORY_GENERATION_PROMPT
+                        },
+                        {
+                            "role": "user",
+                            "content": f"[내용 분류]\n{json.dumps(data.get('tags', {}), ensure_ascii=False)}\n\n[주제문]\n{data.get('user_input', '')}"
+                        }
+                    ],
+                    temperature=0.7
+                )
+                base_story = response.choices[0].message.content
+                logger.info("Base story generated successfully", extra={
+                    "request_id": request_id,
+                    "base_story_length": len(base_story),
+                    "base_story": base_story
+                })
+            except Exception as e:
+                logger.error(f"Failed to generate base story: {str(e)}", exc_info=True)
+                raise Exception("기본 이야기 생성에 실패했습니다")
+
+            # base_story를 GPT-4o로 확장
             for result in StoryGenerator.generate_story_and_title(
-                data.get('user_input', ''),
+                base_story,  # user_input 대신 base_story 전달
                 openai_thread_id
             ):
                 if result["msg"] == "expanding":

@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, Response, stream_with_context
+from flask import Blueprint, request, jsonify, Response, stream_with_context, current_app
 from app.services.story_service import StoryService
 from app.services.search_service import SearchService
 from app.services.analysis_service import AnalysisService
@@ -11,6 +11,7 @@ from app.services.history_service import HistoryService
 from app.services.evaluation_service import EvaluationService
 import traceback
 import time
+from app.services.story_service import ConversationManager, ThreadManager
 
 api_bp = Blueprint('api', __name__)
 
@@ -75,12 +76,46 @@ def generate_story():
             
         def generate():
             try:
-                # thread_id와 conversation_id가 제공된 경우 그대로 사용
+                # thread_id가 없으면 새로 생성
                 thread_id = data.get('thread_id')
-                conversation_id = data.get('conversation_id')
+                if not thread_id:
+                    try:
+                        thread_id = ThreadManager.create_thread(user_id)
+                        data['thread_id'] = thread_id
+                        current_app.logger.info(f"Created new thread: {thread_id}")
+                    except Exception as e:
+                        current_app.logger.error(f"Failed to create thread: {str(e)}")
+                        raise Exception("스레드 생성에 실패했습니다")
                 
-                if thread_id and conversation_id:
-                    print(f"[DEBUG] Using provided thread_id={thread_id}, conversation_id={conversation_id}")
+                # conversation_id가 없으면 생성
+                conversation_id = data.get('conversation_id')
+                if not conversation_id:
+                    try:
+                        conversation_id = ConversationManager.create_conversation(thread_id)
+                        data['conversation_id'] = conversation_id
+                        current_app.logger.info(f"Created new conversation: {conversation_id}")
+                    except Exception as e:
+                        current_app.logger.error(f"Failed to create conversation: {str(e)}")
+                        raise Exception("대화 생성에 실패했습니다")
+                
+                # user_input과 tags 저장
+                with Database() as db:
+                    db.connection.start_transaction()
+                    try:
+                        ConversationManager.save_conversation_data(
+                            db, thread_id, conversation_id, 
+                            'user_input', data.get('user_input', '')
+                        )
+                        ConversationManager.save_conversation_data(
+                            db, thread_id, conversation_id, 
+                            'tags', json.dumps(data.get('tags', {}), ensure_ascii=False)
+                        )
+                        db.connection.commit()
+                        current_app.logger.info(f"Saved initial data for conversation: {conversation_id}")
+                    except Exception as e:
+                        db.connection.rollback()
+                        current_app.logger.error(f"Failed to save initial data: {str(e)}")
+                        raise Exception("초기 데이터 저장에 실패했습니다")
                 
                 story_generator = StoryService.hybrid_generate_story_with_assistant(data)
                 final_content = None
@@ -386,22 +421,55 @@ def update_thread_title():
 @log_request_response
 def cancel_generation():
     try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "데이터가 제공되지 않았습니다"}), 400
+        with Database() as db:
+            data = request.json
+            if not data:
+                return jsonify({"error": "데이터가 제공되지 않았습니다"}), 400
+                
+            thread_id = data.get('thread_id')
+            conversation_id = data.get('conversation_id')
             
-        thread_id = data.get('thread_id')
-        conversation_id = data.get('conversation_id')
-        
-        if not all([thread_id, conversation_id]):
-            return jsonify({"error": "필수 파라미터가 누락되었습니다"}), 400
+            if not all([thread_id, conversation_id]):
+                return jsonify({"error": "필수 파라미터가 누락되었습니다"}), 400
+                
+            result = StoryService.cancel_generation(thread_id, conversation_id)
             
-        result = StoryService.cancel_generation(thread_id, conversation_id)
-        
-        if result.get("success"):
-            return jsonify(result)
-        else:
-            return jsonify({"error": result.get("error", "이야기 생성 중단에 실패했습니다")}), 500
+            if result.get("success"):
+                try:
+                    # user_input과 tags 조회
+                    db.execute(
+                        """SELECT 
+                            MAX(CASE WHEN category = 'user_input' THEN data END) as user_input,
+                            MAX(CASE WHEN category = 'tags' THEN data END) as tags
+                           FROM conversation_data 
+                           WHERE thread_id = %s 
+                           AND conversation_id = %s
+                           AND category IN ('user_input', 'tags')
+                           GROUP BY thread_id, conversation_id""",
+                        (thread_id, conversation_id)
+                    )
+                    db_result = db.fetchone()
+                    
+                    return jsonify({
+                        "success": True,
+                        "message": "Generation cancelled successfully",
+                        "thread_id": thread_id,
+                        "conversation_id": conversation_id,
+                        "user_input": db_result['user_input'] if db_result else "",
+                        "tags": json.loads(db_result['tags']) if db_result and db_result['tags'] else {}
+                    })
+                except Exception as db_error:
+                    current_app.logger.error(f"Database error while fetching user_input and tags: {str(db_error)}")
+                    return jsonify({
+                        "success": True,
+                        "message": "Generation cancelled successfully but failed to fetch additional data",
+                        "thread_id": thread_id,
+                        "conversation_id": conversation_id,
+                        "user_input": "",
+                        "tags": {}
+                    })
+            else:
+                return jsonify({"error": result.get("error", "이야기 생성 중단에 실패했습니다")}), 500
             
     except Exception as e:
         return jsonify({"error": str(e)}), 500

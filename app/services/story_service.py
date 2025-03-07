@@ -124,6 +124,7 @@ class ConversationManager:
                        VALUES (%s, %s, %s, %s, %s)""",
                     (thread_id, next_id, 'in_progress', run_id, 0)
                 )
+                
                 db.connection.commit()
                 logger.info(f"Created conversation: {next_id}", 
                           extra={"thread_id": thread_id, "conversation_id": next_id})
@@ -545,7 +546,6 @@ class StoryService:
             conversation_id = data.get('conversation_id')
             user_id = data.get('user_id')
             user_input = data.get('user_input', '')
-            tags = data.get('tags', {})
 
             if not all([thread_id, conversation_id, user_id]):
                 raise ValueError("Required parameters missing")
@@ -560,6 +560,26 @@ class StoryService:
                 )
                 if not db.fetchone():
                     raise ValueError("Invalid thread_id, conversation_id, or unauthorized access")
+
+                # 기존 recommendations 조회
+                db.execute(
+                    """SELECT category, data
+                       FROM conversation_data
+                       WHERE thread_id = %s 
+                       AND conversation_id = %s
+                       AND category IN ('recommended_1', 'recommended_2', 'recommended_3')
+                       ORDER BY category""",
+                    (thread_id, conversation_id)
+                )
+                existing_recommendations = db.fetchall()
+                recommendations = []
+                if existing_recommendations:
+                    recommendations = [row['data'] for row in existing_recommendations]
+                else:
+                    recommendations = [
+                        f"추천 {i+1}: {user_input}와(과) 비슷한 이야기"
+                        for i in range(3)
+                    ]
 
                 # 유사한 문서 검색
                 search_results = []
@@ -585,20 +605,20 @@ class StoryService:
                                 'title': result.get('title', '제목 없음')
                             },
                             'content': result.get('content', ''),
-                            'score': 1.0 - (idx * 0.1)  # 간단한 점수 계산
+                            'score': 1.0 - (idx * 0.1)
                         })
                     except Exception as e:
                         logger.error(f"Error processing search result: {str(e)}", exc_info=True)
                         continue
 
-                # 임시 추천 문서 생성
-                recommendations = [
-                    f"추천 {i+1}: {user_input}와(과) 비슷한 이야기"
-                    for i in range(3)
-                ]
+                # similar 결과만 업데이트
+                try:
+                    cls.update_similar_results(thread_id, conversation_id, user_id, search_results)
+                except Exception as e:
+                    logger.error(f"Failed to update similar results: {str(e)}", exc_info=True)
 
-                # 결과를 클라이언트가 기대하는 형식으로 구성
-                formatted_result = {
+                # 결과 반환
+                return {
                     "success": True,
                     "result": {
                         "similar_1": search_results[0] if len(search_results) > 0 else {},
@@ -609,21 +629,6 @@ class StoryService:
                         "recommended_3": recommendations[2] if len(recommendations) > 2 else ""
                     }
                 }
-
-                # 검색 결과 업데이트
-                try:
-                    cls.update_search_results(
-                        thread_id=thread_id,
-                        conversation_id=conversation_id,
-                        user_id=user_id,
-                        search_results=search_results,
-                        recommendations=recommendations
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to update search results: {str(e)}", exc_info=True)
-                    # 업데이트 실패해도 검색 결과는 반환
-
-                return formatted_result
 
         except Exception as e:
             logger.error(f"Search and recommend failed: {str(e)}", exc_info=True)
@@ -802,10 +807,13 @@ class StoryService:
             # 기존 thread_id가 있는지 확인
             existing_db_thread_id = data.get('thread_id')
             user_id = data.get('user_id')
+            user_input = data.get('user_input', '')
+            tags = data.get('tags', {})
             
             # thread_id가 없으면 새로 생성
             if existing_db_thread_id is None:
                 thread_id = ThreadManager.create_thread(user_id)
+                data['thread_id'] = thread_id
             else:
                 thread_id = existing_db_thread_id
             
@@ -815,8 +823,12 @@ class StoryService:
                 openai_thread_id = OpenAIAssistantManager.create_thread()
                 ThreadManager.update_openai_thread_id(thread_id, openai_thread_id)
             
-            # conversation 생성
-            conversation_id = ConversationManager.create_conversation(thread_id)
+            # conversation_id 가져오기
+            conversation_id = data.get('conversation_id')
+            if not conversation_id:
+                conversation_id = ConversationManager.create_conversation(thread_id)
+                data['conversation_id'] = conversation_id
+            
             cancellation_key = f"{thread_id}_{conversation_id}"
             cls._cancellation_flags[cancellation_key] = False
 
@@ -923,10 +935,8 @@ class StoryService:
                             if existing_db_thread_id is None:
                                 ThreadManager.update_thread_title(thread_id, story_data["title"])
                             
-                            # 대화 데이터 저장
+                            # 대화 데이터 저장 (user_input과 tags 제외)
                             data_items = [
-                                ('user_input', data.get('user_input', '')),
-                                ('tags', json.dumps(data.get('tags', {}), ensure_ascii=False)),
                                 ('created_content', story_data["story"]),
                                 ('created_title', story_data["title"])
                             ]
@@ -936,12 +946,15 @@ class StoryService:
                                     db, thread_id, conversation_id, category, value
                                 )
                             
-                            # 추천 데이터 저장
-                            for i, rec in enumerate(story_data["recommendations"][:3], 1):
-                                ConversationManager.save_conversation_data(
-                                    db, thread_id, conversation_id, 
-                                    f'recommended_{i}', rec
-                                )
+                            db.connection.commit()
+                            
+                            # recommendations 저장 (별도 트랜잭션으로 처리)
+                            cls.update_recommendations(
+                                thread_id, 
+                                conversation_id, 
+                                user_id, 
+                                story_data["recommendations"][:3]
+                            )
                             
                             # conversation 완료 상태로 업데이트 (취소되지 않은 경우에만)
                             if not was_cancelled:
@@ -950,7 +963,6 @@ class StoryService:
                                     status='completed'
                                 )
                             
-                            db.connection.commit()
                             logger.info("Successfully saved all data", 
                                       extra={"request_id": request_id})
                             
@@ -1024,3 +1036,88 @@ class StoryService:
         except Exception as e:
             logger.error(f"Unexpected error during thread deletion: {str(e)}", exc_info=True)
             return {"success": False, "error": f"Unexpected error: {str(e)}"}
+
+    @classmethod
+    def update_similar_results(cls, thread_id: int, conversation_id: int, user_id: int,
+                             search_results: List[Dict[str, Any]]) -> Dict[str, bool]:
+        """유사 문서 검색 결과만 업데이트"""
+        try:
+            with Database() as db:
+                db.connection.start_transaction()
+                try:
+                    # 소유권 확인
+                    db.execute(
+                        """SELECT 1 FROM threads t 
+                           JOIN conversations c ON t.id = c.thread_id 
+                           WHERE t.id = %s AND c.conversation_id = %s AND t.user_id = %s""",
+                        (thread_id, conversation_id, user_id)
+                    )
+                    if not db.fetchone():
+                        raise Exception("Invalid thread_id, conversation_id, or unauthorized access")
+
+                    # similar 결과만 업데이트
+                    for idx, category in enumerate(['similar_1', 'similar_2', 'similar_3'], 1):
+                        result = search_results[idx-1] if idx <= len(search_results) else {}
+                        db.execute(
+                            """INSERT INTO conversation_data 
+                               (thread_id, conversation_id, category, data)
+                               VALUES (%s, %s, %s, %s)
+                               ON DUPLICATE KEY UPDATE data = VALUES(data)""",
+                            (thread_id, conversation_id, category, 
+                             json.dumps(result, ensure_ascii=False))
+                        )
+
+                    db.connection.commit()
+                    logger.info(f"Successfully updated similar results for thread_id: {thread_id}, conversation_id: {conversation_id}")
+                    return {"success": True}
+
+                except Exception as e:
+                    db.connection.rollback()
+                    logger.error(f"Database transaction failed: {str(e)}", exc_info=True)
+                    raise
+
+        except Exception as e:
+            logger.error(f"Failed to update similar results: {str(e)}", exc_info=True)
+            return {"success": False}
+
+    @classmethod
+    def update_recommendations(cls, thread_id: int, conversation_id: int, user_id: int,
+                             recommendations: List[str]) -> Dict[str, bool]:
+        """추천 결과만 업데이트"""
+        try:
+            with Database() as db:
+                db.connection.start_transaction()
+                try:
+                    # 소유권 확인
+                    db.execute(
+                        """SELECT 1 FROM threads t 
+                           JOIN conversations c ON t.id = c.thread_id 
+                           WHERE t.id = %s AND c.conversation_id = %s AND t.user_id = %s""",
+                        (thread_id, conversation_id, user_id)
+                    )
+                    if not db.fetchone():
+                        raise Exception("Invalid thread_id, conversation_id, or unauthorized access")
+
+                    # recommendations만 업데이트
+                    for idx, category in enumerate(['recommended_1', 'recommended_2', 'recommended_3'], 1):
+                        recommendation = recommendations[idx-1] if idx <= len(recommendations) else ""
+                        db.execute(
+                            """INSERT INTO conversation_data 
+                               (thread_id, conversation_id, category, data)
+                               VALUES (%s, %s, %s, %s)
+                               ON DUPLICATE KEY UPDATE data = VALUES(data)""",
+                            (thread_id, conversation_id, category, recommendation)
+                        )
+
+                    db.connection.commit()
+                    logger.info(f"Successfully updated recommendations for thread_id: {thread_id}, conversation_id: {conversation_id}")
+                    return {"success": True}
+
+                except Exception as e:
+                    db.connection.rollback()
+                    logger.error(f"Database transaction failed: {str(e)}", exc_info=True)
+                    raise
+
+        except Exception as e:
+            logger.error(f"Failed to update recommendations: {str(e)}", exc_info=True)
+            return {"success": False}

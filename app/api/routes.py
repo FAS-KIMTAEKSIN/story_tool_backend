@@ -78,25 +78,44 @@ def generate_story():
             try:
                 # thread_id가 없으면 새로 생성
                 thread_id = data.get('thread_id')
+                conversation_id = data.get('conversation_id')
+                ids_created = False
+                
+                # thread_id가 없으면 새로 생성
                 if not thread_id:
                     try:
                         thread_id = ThreadManager.create_thread(user_id)
                         data['thread_id'] = thread_id
                         current_app.logger.info(f"Created new thread: {thread_id}")
+                        
+                        # conversation_id 생성
+                        conversation_id = ConversationManager.create_conversation(thread_id)
+                        data['conversation_id'] = conversation_id
+                        current_app.logger.info(f"Created new conversation: {conversation_id}")
+                        ids_created = True
+                        
+                        # thread_id와 conversation_id를 한 번에 전달
+                        yield f"data: {json.dumps({'thread_id': thread_id, 'conversation_id': conversation_id}, ensure_ascii=False)}\n\n"
                     except Exception as e:
-                        current_app.logger.error(f"Failed to create thread: {str(e)}")
-                        raise Exception("스레드 생성에 실패했습니다")
-                
-                # conversation_id가 없으면 생성
-                conversation_id = data.get('conversation_id')
-                if not conversation_id:
+                        current_app.logger.error(f"Failed to create thread or conversation: {str(e)}")
+                        raise Exception("스레드 또는 대화 생성에 실패했습니다")
+                # thread_id는 있지만 conversation_id가 없는 경우
+                elif not conversation_id:
                     try:
                         conversation_id = ConversationManager.create_conversation(thread_id)
                         data['conversation_id'] = conversation_id
                         current_app.logger.info(f"Created new conversation: {conversation_id}")
+                        ids_created = True
+                        
+                        # conversation_id 전달
+                        yield f"data: {json.dumps({'thread_id': thread_id, 'conversation_id': conversation_id}, ensure_ascii=False)}\n\n"
                     except Exception as e:
                         current_app.logger.error(f"Failed to create conversation: {str(e)}")
                         raise Exception("대화 생성에 실패했습니다")
+                
+                # ID 생성 후 또는 이미 존재하는 ID 확인
+                if not ids_created:
+                    current_app.logger.info(f"Using existing thread_id: {thread_id} and conversation_id: {conversation_id}")
                 
                 # user_input과 tags 저장
                 with Database() as db:

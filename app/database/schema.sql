@@ -23,9 +23,21 @@ CREATE TABLE conversations (
     id INT AUTO_INCREMENT PRIMARY KEY,             -- 내부 관리용 고유 ID
     conversation_id INT NOT NULL,                  -- 스레드 내 대화 순서
     thread_id INT NOT NULL,                        -- 대화창 ID
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY unique_thread_conversation (thread_id, conversation_id),
-    FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- 대화 생성 시간
+    is_cancelled TINYINT(1) DEFAULT 0,            -- 대화 중단 여부 (0: 진행중/완료, 1: 중단됨)
+    cancelled_at TIMESTAMP NULL,                   -- 대화 중단 시간
+    completion_status VARCHAR(20) CHECK (          -- 대화 완료 상태
+        completion_status IN (
+            'completed',                          -- 정상 완료
+            'cancelled',                          -- 중단됨
+            'failed',                             -- 실패 (API 오류 등)
+            'expired',                            -- 시간 초과
+            'in_progress'                         -- 생성 중
+        )
+    ) DEFAULT 'in_progress',
+    current_run_id VARCHAR(255) NULL,             -- OpenAI Assistant API의 현재 실행 ID
+    UNIQUE KEY unique_thread_conversation (thread_id, conversation_id), -- 스레드 내 대화 순서 유일성
+    FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE   -- 대화창 삭제시 함께 삭제
 );
 -- 대화 내용 저장 테이블
 CREATE TABLE conversation_data (

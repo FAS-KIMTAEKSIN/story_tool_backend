@@ -38,7 +38,6 @@ class Config:
     DB_USER = os.getenv('DB_USER')
     DB_PASSWORD = os.getenv('DB_PASSWORD')
     DB_NAME = os.getenv('DB_NAME')
-    DB_TIMEZONE = os.getenv('DB_TIMEZONE', '+09:00')  # 기본값 KST
     
     # VAIV API 설정
     VAIV_API_BASE_URL = 'https://story.vaiv.kr/gradio_api'

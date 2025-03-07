@@ -9,6 +9,7 @@ import requests
 import logging
 from typing import Optional, Dict, Any, Generator, List
 from app.services.history_service import HistoryService
+import uuid
 
 # 로깅 설정
 logging.basicConfig(level=logging.DEBUG)
@@ -28,7 +29,7 @@ class ThreadManager:
     """Thread 관리를 담당하는 클래스"""
     
     @staticmethod
-    def create_thread(user_id: str, title: str, openai_thread_id: str) -> int:
+    def create_thread(user_id: str, title: str = "새 이야기", openai_thread_id: str = "") -> int:
         """새로운 thread 생성"""
         with Database() as db:
             db.connection.start_transaction()
@@ -46,6 +47,35 @@ class ThreadManager:
                 db.connection.rollback()
                 logger.error(f"Failed to create thread: {str(e)}", exc_info=True)
                 raise
+
+    @staticmethod
+    def get_openai_thread_id(thread_id: int) -> Optional[str]:
+        """thread의 OpenAI thread ID 조회"""
+        with Database() as db:
+            try:
+                db.execute(
+                    """SELECT thread_id FROM threads WHERE id = %s""",
+                    (thread_id,)
+                )
+                result = db.fetchone()
+                return result['thread_id'] if result else None
+            except Exception as e:
+                logger.error(f"Failed to get OpenAI thread ID: {str(e)}", exc_info=True)
+                return None
+
+    @staticmethod
+    def update_openai_thread_id(thread_id: int, openai_thread_id: str) -> bool:
+        """thread의 OpenAI thread ID 업데이트"""
+        with Database() as db:
+            try:
+                db.execute(
+                    """UPDATE threads SET thread_id = %s WHERE id = %s""",
+                    (openai_thread_id, thread_id)
+                )
+                return True
+            except Exception as e:
+                logger.error(f"Failed to update OpenAI thread ID: {str(e)}", exc_info=True)
+                return False
 
     @staticmethod
     def update_thread_title(thread_id: int, title: str, only_if_new: bool = False) -> bool:
@@ -74,7 +104,7 @@ class ConversationManager:
     """Conversation 관리를 담당하는 클래스"""
     
     @staticmethod
-    def create_conversation(thread_id: int) -> int:
+    def create_conversation(thread_id: int, run_id: Optional[str] = None) -> int:
         """새로운 conversation 생성"""
         with Database() as db:
             db.connection.start_transaction()
@@ -89,10 +119,12 @@ class ConversationManager:
                 
                 # conversation 생성
                 db.execute(
-                    """INSERT INTO conversations (thread_id, conversation_id) 
-                       VALUES (%s, %s)""",
-                    (thread_id, next_id)
+                    """INSERT INTO conversations 
+                       (thread_id, conversation_id, completion_status, current_run_id, is_cancelled) 
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (thread_id, next_id, 'in_progress', run_id, 0)
                 )
+                
                 db.connection.commit()
                 logger.info(f"Created conversation: {next_id}", 
                           extra={"thread_id": thread_id, "conversation_id": next_id})
@@ -101,6 +133,75 @@ class ConversationManager:
                 db.connection.rollback()
                 logger.error(f"Failed to create conversation: {str(e)}", exc_info=True)
                 raise
+
+    @staticmethod
+    def update_conversation_status(db, thread_id: int, conversation_id: int,
+                                 status: str, run_id: Optional[str] = None,
+                                 is_cancelled: bool = False) -> bool:
+        """conversation 상태 업데이트"""
+        try:
+            update_fields = ["completion_status = %s"]
+            params = [status]
+
+            if run_id is not None:
+                update_fields.append("current_run_id = %s")
+                params.append(run_id)
+
+            if is_cancelled:
+                update_fields.append("is_cancelled = 1")
+                update_fields.append("cancelled_at = CURRENT_TIMESTAMP")
+
+            query = f"""UPDATE conversations 
+                       SET {', '.join(update_fields)}
+                       WHERE thread_id = %s AND conversation_id = %s"""
+            params.extend([thread_id, conversation_id])
+
+            db.execute(query, tuple(params))
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update conversation status: {str(e)}", exc_info=True)
+            return False
+
+    @staticmethod
+    def cancel_conversation(thread_id: int, conversation_id: int) -> bool:
+        """conversation 중단"""
+        with Database() as db:
+            db.connection.start_transaction()
+            try:
+                success = ConversationManager.update_conversation_status(
+                    db, thread_id, conversation_id,
+                    status='cancelled',
+                    is_cancelled=True
+                )
+                if success:
+                    db.connection.commit()
+                    return True
+                db.connection.rollback()
+                return False
+            except Exception as e:
+                db.connection.rollback()
+                logger.error(f"Failed to cancel conversation: {str(e)}", exc_info=True)
+                return False
+
+    @staticmethod
+    def complete_conversation(thread_id: int, conversation_id: int) -> bool:
+        """conversation 완료"""
+        with Database() as db:
+            db.connection.start_transaction()
+            try:
+                success = ConversationManager.update_conversation_status(
+                    db, thread_id, conversation_id,
+                    status='completed'
+                )
+                if success:
+                    db.connection.commit()
+                    return True
+                db.connection.rollback()
+                return False
+            except Exception as e:
+                db.connection.rollback()
+                logger.error(f"Failed to complete conversation: {str(e)}", exc_info=True)
+                return False
 
     @staticmethod
     def save_conversation_data(db, thread_id: int, conversation_id: int, 
@@ -122,7 +223,6 @@ class OpenAIAssistantManager:
     """OpenAI Assistant 관리를 담당하는 클래스"""
     
     gpt4o_assistant = None
-    current_openai_thread_id = None
     TIMEOUT = 60  # API 타임아웃 설정
 
     @classmethod
@@ -153,15 +253,15 @@ class OpenAIAssistantManager:
             return False
 
     @classmethod
-    def create_or_get_thread(cls, existing_thread_id: Optional[str] = None) -> str:
-        """OpenAI thread 생성 또는 가져오기"""
-        if existing_thread_id:
-            cls.current_openai_thread_id = existing_thread_id
-            return existing_thread_id
-        
-        thread = openai_client.beta.threads.create()
-        cls.current_openai_thread_id = thread.id
-        return thread.id
+    def create_thread(cls) -> str:
+        """새로운 OpenAI thread 생성"""
+        try:
+            thread = openai_client.beta.threads.create()
+            logger.info(f"Created new OpenAI thread: {thread.id}")
+            return thread.id
+        except Exception as e:
+            logger.error(f"Failed to create OpenAI thread: {str(e)}", exc_info=True)
+            raise
 
 class StoryGenerator:
     """이야기 생성을 담당하는 클래스"""
@@ -192,32 +292,41 @@ class StoryGenerator:
 
     @classmethod
     def generate_story_and_title(cls, user_input: str, 
-                               existing_thread_id: Optional[str] = None) -> Generator:
+                               thread_id: str) -> Generator:
         """이야기와 제목 생성"""
         try:
             expanded_story = ""
-            openai_thread_id = OpenAIAssistantManager.create_or_get_thread(existing_thread_id)
+            was_cancelled = False
             
-            for content in cls._expand_story(user_input, openai_thread_id):
+            for content, run_id, is_cancelled in cls._expand_story(user_input, thread_id):
+                if is_cancelled:
+                    was_cancelled = True
+                    yield {
+                        "msg": "cancelled",
+                        "content": expanded_story
+                    }
+                    return
+                
                 expanded_story += content
                 yield {
                     "msg": "expanding",
-                    "content": content
+                    "content": content,
+                    "run_id": run_id
                 }
             
             if not expanded_story:
                 raise Exception("이야기 생성 실패")
             
-            result = cls._generate_title_and_recommendations(expanded_story, user_input)
-            
-            yield {
-                "msg": "completed",
-                "content": {
-                    "story": expanded_story,
-                    "title": result["title"],
-                    "recommendations": result["recommendations"]
+            if not was_cancelled:
+                result = cls._generate_title_and_recommendations(expanded_story, user_input)
+                yield {
+                    "msg": "completed",
+                    "content": {
+                        "story": expanded_story,
+                        "title": result["title"],
+                        "recommendations": result["recommendations"]
+                    }
                 }
-            }
             
         except Exception as e:
             logger.error(f"Failed to generate story: {str(e)}", exc_info=True)
@@ -252,51 +361,80 @@ class StoryGenerator:
                     assistant_id=OpenAIAssistantManager.gpt4o_assistant.id,
                     stream=True
                 )
-                logger.info("Stream created successfully")
+                
+                run_id = None
+                current_content = ""
+                message_id = None
+                is_cancelled = False  # 취소 상태 추적
+                
+                # 스트리밍 이벤트 처리
+                for event in stream:
+                    event_type = getattr(event, 'event', None)
+                    # logger.debug(f"Received event: {event_type}")
+                    
+                    if event_type == 'thread.run.created':
+                        run_id = event.data.id
+                        logger.info(f"Run created successfully with run_id: {run_id}")
+                        continue
+                    
+                    if event_type == 'thread.message.delta':
+                        if run_id is None:
+                            logger.error("Run ID not found in stream")
+                            raise Exception("Failed to get run ID from stream")
+                            
+                        delta = event.data.delta
+                        if delta.content and len(delta.content) > 0:
+                            content_item = delta.content[0]
+                            if hasattr(content_item, 'text') and hasattr(content_item.text, 'value'):
+                                text_value = content_item.text.value
+                                current_content += text_value
+                                # logger.info(f"Received content chunk (length: {len(text_value)})")
+                                
+                                # 각 청크마다 취소 상태 확인
+                                if StoryService._cancellation_flags.get(f"{thread_id}_{run_id}", False):
+                                    is_cancelled = True
+                                    logger.info("Cancellation detected during content streaming")
+                                    yield text_value, run_id, True
+                                    return
+                                
+                                yield text_value, run_id, False
+                    
+                    elif event_type == 'thread.message.completed':
+                        if not message_id:
+                            message_id = event.data.id
+                            logger.info(f"Message completed: {message_id}")
+                    
+                    elif event_type == 'thread.run.completed':
+                        logger.info("Run completed event received")
+                        # 취소된 상태면 완료 처리하지 않음
+                        if is_cancelled or StoryService._cancellation_flags.get(f"{thread_id}_{run_id}", False):
+                            logger.info("Run was cancelled, ignoring completion")
+                            return
+                        
+                        if not current_content:
+                            logger.error("No content generated during story expansion")
+                            raise Exception("이야기 생성에 실패했습니다: 내용이 비어있습니다")
+                        
+                        logger.info("Run completed successfully")
+                        return
+                    
+                    elif event_type == 'thread.run.failed':
+                        error_msg = getattr(event.data, 'last_error', 'Unknown error')
+                        logger.error(f"Run failed: {error_msg}")
+                        raise Exception(f"Story expansion failed: {error_msg}")
+                    
+                    elif event_type in ['thread.run.cancelled', 'thread.run.step.cancelled']:
+                        logger.info(f"Run cancelled event received: {event_type}")
+                        is_cancelled = True
+                        return
+                
+                if not current_content:
+                    logger.error("No content generated during story expansion")
+                    raise Exception("이야기 생성에 실패했습니다: 내용이 비어있습니다")
+                
             except Exception as e:
-                logger.error("Failed to create stream", exc_info=True)
+                logger.error("Failed to create or process stream", exc_info=True)
                 raise
-            
-            current_content = ""
-            message_id = None
-            
-            # 스트리밍 이벤트 처리
-            for event in stream:
-                event_type = getattr(event, 'event', None)
-                logger.debug(f"Received event: {event_type}")
-                
-                if event_type == 'thread.message.delta':
-                    delta = event.data.delta
-                    if delta.content and len(delta.content) > 0:
-                        content_item = delta.content[0]
-                        if hasattr(content_item, 'text') and hasattr(content_item.text, 'value'):
-                            text_value = content_item.text.value
-                            current_content += text_value
-                            logger.info(f"Received content chunk (length: {len(text_value)})")
-                            yield text_value
-                
-                elif event_type == 'thread.message.completed':
-                    if not message_id:
-                        message_id = event.data.id
-                        logger.info(f"Message completed: {message_id}")
-                
-                elif event_type == 'thread.run.completed':
-                    logger.info("Run completed successfully")
-                    if not current_content:
-                        logger.error("No content generated during story expansion")
-                        raise Exception("이야기 생성에 실패했습니다: 내용이 비어있습니다")
-                    return
-                
-                elif event_type == 'thread.run.failed':
-                    error_msg = getattr(event.data, 'last_error', 'Unknown error')
-                    logger.error(f"Run failed: {error_msg}")
-                    raise Exception(f"Story expansion failed: {error_msg}")
-            
-            if not current_content:
-                logger.error("No content generated during story expansion")
-                raise Exception("이야기 생성에 실패했습니다: 내용이 비어있습니다")
-            
-            logger.info("=== Story Expansion Completed Successfully ===")
             
         except Exception as e:
             logger.error(f"Story expansion failed: {str(e)}", exc_info=True)
@@ -343,10 +481,12 @@ class StoryService:
     """전체 스토리 서비스를 관리하는 메인 클래스"""
     
     _search_cache = {}  # 검색 결과 캐시
+    _cancellation_flags = {}  # 생성 중단 플래그를 저장하는 딕셔너리
     
     @classmethod
     def initialize(cls) -> bool:
         """서비스 초기화"""
+        cls._cancellation_flags = {}
         return OpenAIAssistantManager.initialize_assistant()
 
     @classmethod
@@ -406,7 +546,6 @@ class StoryService:
             conversation_id = data.get('conversation_id')
             user_id = data.get('user_id')
             user_input = data.get('user_input', '')
-            tags = data.get('tags', {})
 
             if not all([thread_id, conversation_id, user_id]):
                 raise ValueError("Required parameters missing")
@@ -421,6 +560,26 @@ class StoryService:
                 )
                 if not db.fetchone():
                     raise ValueError("Invalid thread_id, conversation_id, or unauthorized access")
+
+                # 기존 recommendations 조회
+                db.execute(
+                    """SELECT category, data
+                       FROM conversation_data
+                       WHERE thread_id = %s 
+                       AND conversation_id = %s
+                       AND category IN ('recommended_1', 'recommended_2', 'recommended_3')
+                       ORDER BY category""",
+                    (thread_id, conversation_id)
+                )
+                existing_recommendations = db.fetchall()
+                recommendations = []
+                if existing_recommendations:
+                    recommendations = [row['data'] for row in existing_recommendations]
+                else:
+                    recommendations = [
+                        f"추천 {i+1}: {user_input}와(과) 비슷한 이야기"
+                        for i in range(3)
+                    ]
 
                 # 유사한 문서 검색
                 search_results = []
@@ -446,20 +605,20 @@ class StoryService:
                                 'title': result.get('title', '제목 없음')
                             },
                             'content': result.get('content', ''),
-                            'score': 1.0 - (idx * 0.1)  # 간단한 점수 계산
+                            'score': 1.0 - (idx * 0.1)
                         })
                     except Exception as e:
                         logger.error(f"Error processing search result: {str(e)}", exc_info=True)
                         continue
 
-                # 임시 추천 문서 생성
-                recommendations = [
-                    f"추천 {i+1}: {user_input}와(과) 비슷한 이야기"
-                    for i in range(3)
-                ]
+                # similar 결과만 업데이트
+                try:
+                    cls.update_similar_results(thread_id, conversation_id, user_id, search_results)
+                except Exception as e:
+                    logger.error(f"Failed to update similar results: {str(e)}", exc_info=True)
 
-                # 결과를 클라이언트가 기대하는 형식으로 구성
-                formatted_result = {
+                # 결과 반환
+                return {
                     "success": True,
                     "result": {
                         "similar_1": search_results[0] if len(search_results) > 0 else {},
@@ -470,21 +629,6 @@ class StoryService:
                         "recommended_3": recommendations[2] if len(recommendations) > 2 else ""
                     }
                 }
-
-                # 검색 결과 업데이트
-                try:
-                    cls.update_search_results(
-                        thread_id=thread_id,
-                        conversation_id=conversation_id,
-                        user_id=user_id,
-                        search_results=search_results,
-                        recommendations=recommendations
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to update search results: {str(e)}", exc_info=True)
-                    # 업데이트 실패해도 검색 결과는 반환
-
-                return formatted_result
 
         except Exception as e:
             logger.error(f"Search and recommend failed: {str(e)}", exc_info=True)
@@ -569,46 +713,219 @@ class StoryService:
         cls._search_cache.clear()
 
     @classmethod
+    def cancel_generation(cls, thread_id: int, conversation_id: int) -> Dict[str, Any]:
+        """이야기 생성을 중단합니다"""
+        try:
+            cancellation_key = f"{thread_id}_{conversation_id}"
+            
+            # 이미 취소된 상태인지 확인
+            if cls._cancellation_flags.get(cancellation_key, False):
+                return {
+                    "success": True,
+                    "message": "Already cancelled",
+                    "thread_id": thread_id,
+                    "conversation_id": conversation_id
+                }
+
+            # DB에서 OpenAI thread_id와 current_run_id 조회
+            with Database() as db:
+                db.execute(
+                    """SELECT t.thread_id as openai_thread_id, c.current_run_id as run_id,
+                            c.completion_status, c.is_cancelled
+                    FROM threads t 
+                    JOIN conversations c ON t.id = c.thread_id 
+                    WHERE t.id = %s AND c.conversation_id = %s""",
+                    (thread_id, conversation_id)
+                )
+                result = db.fetchone()
+                
+                # 이미 완료되었거나 취소된 상태면 early return
+                if result and (
+                    result['completion_status'] in ['completed', 'cancelled'] or 
+                    result['is_cancelled']
+                ):
+                    return {
+                        "success": True,
+                        "message": f"Already in {result['completion_status']} state",
+                        "thread_id": thread_id,
+                        "conversation_id": conversation_id
+                    }
+                
+                if result and result['openai_thread_id'] and result['run_id']:
+                    try:
+                        # OpenAI run 취소 시도
+                        openai_client.beta.threads.runs.cancel(
+                            thread_id=result['openai_thread_id'],
+                            run_id=result['run_id']
+                        )
+                        logger.info(f"Successfully cancelled OpenAI run: {result['run_id']}")
+                        
+                        # OpenAI 취소가 성공한 경우에만 로컬 취소 진행
+                        cls._cancellation_flags[cancellation_key] = True
+                        
+                        # conversation 상태 업데이트
+                        if ConversationManager.cancel_conversation(thread_id, conversation_id):
+                            return {
+                                "success": True, 
+                                "message": "Generation cancelled successfully",
+                                "thread_id": thread_id,
+                                "conversation_id": conversation_id
+                            }
+                        else:
+                            return {"success": False, "error": "Failed to update conversation status"}
+                            
+                    except Exception as e:
+                        # OpenAI 취소 실패 시 에러 반환
+                        logger.error(f"Failed to cancel OpenAI run: {str(e)}", exc_info=True)
+                        return {
+                            "success": False,
+                            "error": "Failed to cancel generation on OpenAI server",
+                            "details": str(e)
+                        }
+                else:
+                    return {
+                        "success": False,
+                        "error": "Required OpenAI IDs not found"
+                    }
+                
+        except Exception as e:
+            logger.error(f"Failed to cancel generation: {str(e)}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    @classmethod
     def hybrid_generate_story_with_assistant(cls, data: Dict[str, Any]) -> Generator:
-        """하이브리드 방식으로 이야기 생성 및 스트리밍"""
-        request_id = generate_session_hash()  # 요청 추적용 ID
-        logger.info(f"Starting story generation", extra={"request_id": request_id})
+        request_id = str(uuid.uuid4())
+        logger.info("Starting hybrid story generation", extra={"request_id": request_id})
+        
+        conversation_id = None
+        cancellation_key = None
+        partial_story = ""
+        was_cancelled = False
+        current_run_id = None
         
         try:
-            user_id = data.get('user_id')
-            if not user_id:
-                raise Exception("유효한 사용자 ID가 없습니다.")
-            
+            # 기존 thread_id가 있는지 확인
             existing_db_thread_id = data.get('thread_id')
-            thread_id = existing_db_thread_id
-            existing_openai_thread_id = None
+            user_id = data.get('user_id')
+            user_input = data.get('user_input', '')
+            tags = data.get('tags', {})
             
-            # 기존 thread의 openai_thread_id 조회
-            if thread_id is not None:
-                with Database() as db:
-                    db.execute(
-                        "SELECT thread_id FROM threads WHERE id = %s",
-                        (thread_id,)
-                    )
-                    result = db.fetchone()
-                    if result:
-                        existing_openai_thread_id = result['thread_id']
-                        logger.info(f"Found existing OpenAI thread ID: {existing_openai_thread_id}")
-            
-            # 새 thread 생성 또는 기존 thread 사용
-            if thread_id is None:
-                openai_thread_id = OpenAIAssistantManager.create_or_get_thread()
-                thread_id = ThreadManager.create_thread(user_id, "새 이야기", openai_thread_id)
+            # thread_id가 없으면 새로 생성
+            if existing_db_thread_id is None:
+                thread_id = ThreadManager.create_thread(user_id)
+                data['thread_id'] = thread_id
             else:
-                openai_thread_id = OpenAIAssistantManager.create_or_get_thread(existing_openai_thread_id)
+                thread_id = existing_db_thread_id
             
-            # 이야기 생성
+            # OpenAI thread 생성 또는 가져오기
+            openai_thread_id = ThreadManager.get_openai_thread_id(thread_id)
+            if not openai_thread_id:
+                openai_thread_id = OpenAIAssistantManager.create_thread()
+                ThreadManager.update_openai_thread_id(thread_id, openai_thread_id)
+            
+            # conversation_id 가져오기
+            conversation_id = data.get('conversation_id')
+            if not conversation_id:
+                conversation_id = ConversationManager.create_conversation(thread_id)
+                data['conversation_id'] = conversation_id
+            
+            cancellation_key = f"{thread_id}_{conversation_id}"
+            cls._cancellation_flags[cancellation_key] = False
+
+            # FINE_TUNING_MODEL로 base_story 생성
+            logger.info("Generating base story with fine-tuned model")
+            base_story = ""
+            try:
+                response = openai_client.chat.completions.create(
+                    model=Config.FINE_TUNED_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": Config.STORY_GENERATION_PROMPT
+                        },
+                        {
+                            "role": "user",
+                            "content": f"[내용 분류]\n{json.dumps(data.get('tags', {}), ensure_ascii=False)}\n\n[주제문]\n{data.get('user_input', '')}"
+                        }
+                    ],
+                    temperature=0.7
+                )
+                base_story = response.choices[0].message.content
+                logger.info("Base story generated successfully", extra={
+                    "request_id": request_id,
+                    "base_story_length": len(base_story),
+                    "base_story": base_story
+                })
+            except Exception as e:
+                logger.error(f"Failed to generate base story: {str(e)}", exc_info=True)
+                raise Exception("기본 이야기 생성에 실패했습니다")
+
+            # base_story를 GPT-4o로 확장
             for result in StoryGenerator.generate_story_and_title(
-                data.get('user_input', ''),
+                base_story,  # user_input 대신 base_story 전달
                 openai_thread_id
             ):
-                if result["msg"] == "completed":
+                if result["msg"] == "expanding":
+                    partial_story = result.get("content", "")
+                    current_run_id = result.get("run_id")
+                    
+                    # OpenAI run_id 기반 취소 키도 설정
+                    if current_run_id:
+                        openai_cancel_key = f"{openai_thread_id}_{current_run_id}"
+                        cls._cancellation_flags[openai_cancel_key] = cls._cancellation_flags.get(cancellation_key, False)
+                    
+                    # 상태 업데이트 (취소되지 않은 경우에만)
+                    if not cls._cancellation_flags.get(cancellation_key, False):
+                        with Database() as db:
+                            ConversationManager.update_conversation_status(
+                                db, thread_id, conversation_id,
+                                status='in_progress',
+                                run_id=current_run_id
+                            )
+                    
+                    yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
+                    
+                    # 중단 여부 확인
+                    if cls._cancellation_flags.get(cancellation_key, False):
+                        was_cancelled = True
+                        logger.info(f"Cancellation detected for {cancellation_key}")
+                        
+                        # 현재까지 생성된 내용 저장
+                        with Database() as db:
+                            db.connection.start_transaction()
+                            try:
+                                # 취소 상태 업데이트
+                                ConversationManager.update_conversation_status(
+                                    db, thread_id, conversation_id,
+                                    status='cancelled',
+                                    is_cancelled=True
+                                )
+                                
+                                # 부분 컨텐츠 저장
+                                ConversationManager.save_conversation_data(
+                                    db, thread_id, conversation_id, 
+                                    'created_content', partial_story
+                                )
+                                db.connection.commit()
+                                logger.info(f"Successfully saved cancelled state and partial content for {cancellation_key}")
+                            except Exception as e:
+                                db.connection.rollback()
+                                logger.error(f"Failed to save cancelled state: {str(e)}", 
+                                           extra={"request_id": request_id}, exc_info=True)
+                        
+                        # 중단 메시지 전송
+                        yield f"data: {json.dumps({'msg': 'cancelled', 'content': partial_story}, ensure_ascii=False)}\n\n"
+                        return
+
+                elif result["msg"] == "completed" and not was_cancelled:
                     story_data = result["content"]
+                    
+                    # 마지막으로 취소 상태 확인
+                    if cls._cancellation_flags.get(cancellation_key, False):
+                        was_cancelled = True
+                        logger.info(f"Late cancellation detected for {cancellation_key}")
+                        yield f"data: {json.dumps({'msg': 'cancelled', 'content': partial_story}, ensure_ascii=False)}\n\n"
+                        return
                     
                     # 데이터베이스 저장
                     with Database() as db:
@@ -618,12 +935,8 @@ class StoryService:
                             if existing_db_thread_id is None:
                                 ThreadManager.update_thread_title(thread_id, story_data["title"])
                             
-                            conversation_id = ConversationManager.create_conversation(thread_id)
-                            
-                            # 대화 데이터 저장
+                            # 대화 데이터 저장 (user_input과 tags 제외)
                             data_items = [
-                                ('user_input', data.get('user_input', '')),
-                                ('tags', json.dumps(data.get('tags', {}), ensure_ascii=False)),
                                 ('created_content', story_data["story"]),
                                 ('created_title', story_data["title"])
                             ]
@@ -633,14 +946,23 @@ class StoryService:
                                     db, thread_id, conversation_id, category, value
                                 )
                             
-                            # 추천 데이터 저장
-                            for i, rec in enumerate(story_data["recommendations"][:3], 1):
-                                ConversationManager.save_conversation_data(
-                                    db, thread_id, conversation_id, 
-                                    f'recommended_{i}', rec
+                            db.connection.commit()
+                            
+                            # recommendations 저장 (별도 트랜잭션으로 처리)
+                            cls.update_recommendations(
+                                thread_id, 
+                                conversation_id, 
+                                user_id, 
+                                story_data["recommendations"][:3]
+                            )
+                            
+                            # conversation 완료 상태로 업데이트 (취소되지 않은 경우에만)
+                            if not was_cancelled:
+                                ConversationManager.update_conversation_status(
+                                    db, thread_id, conversation_id,
+                                    status='completed'
                                 )
                             
-                            db.connection.commit()
                             logger.info("Successfully saved all data", 
                                       extra={"request_id": request_id})
                             
@@ -669,6 +991,13 @@ class StoryService:
             logger.error(f"Story generation failed: {str(e)}", 
                         extra={"request_id": request_id}, exc_info=True)
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+        finally:
+            # 중단 플래그 정리
+            if cancellation_key:
+                cls._cancellation_flags.pop(cancellation_key, None)
+            if current_run_id and openai_thread_id:
+                openai_cancel_key = f"{openai_thread_id}_{current_run_id}"
+                cls._cancellation_flags.pop(openai_cancel_key, None)
 
     @classmethod
     def delete_thread(cls, thread_id: int, user_id: int) -> dict:
@@ -698,7 +1027,7 @@ class StoryService:
                     return {"success": False, "error": "OpenAI thread deletion failed"}
                     
                 logger.info(f"Successfully deleted OpenAI thread: {openai_thread_id}")
-                return {"success": True}
+                return {"success": True, "status": 200}
                 
             except Exception as api_error:
                 logger.error(f"OpenAI API error: {str(api_error)}", exc_info=True)
@@ -707,3 +1036,88 @@ class StoryService:
         except Exception as e:
             logger.error(f"Unexpected error during thread deletion: {str(e)}", exc_info=True)
             return {"success": False, "error": f"Unexpected error: {str(e)}"}
+
+    @classmethod
+    def update_similar_results(cls, thread_id: int, conversation_id: int, user_id: int,
+                             search_results: List[Dict[str, Any]]) -> Dict[str, bool]:
+        """유사 문서 검색 결과만 업데이트"""
+        try:
+            with Database() as db:
+                db.connection.start_transaction()
+                try:
+                    # 소유권 확인
+                    db.execute(
+                        """SELECT 1 FROM threads t 
+                           JOIN conversations c ON t.id = c.thread_id 
+                           WHERE t.id = %s AND c.conversation_id = %s AND t.user_id = %s""",
+                        (thread_id, conversation_id, user_id)
+                    )
+                    if not db.fetchone():
+                        raise Exception("Invalid thread_id, conversation_id, or unauthorized access")
+
+                    # similar 결과만 업데이트
+                    for idx, category in enumerate(['similar_1', 'similar_2', 'similar_3'], 1):
+                        result = search_results[idx-1] if idx <= len(search_results) else {}
+                        db.execute(
+                            """INSERT INTO conversation_data 
+                               (thread_id, conversation_id, category, data)
+                               VALUES (%s, %s, %s, %s)
+                               ON DUPLICATE KEY UPDATE data = VALUES(data)""",
+                            (thread_id, conversation_id, category, 
+                             json.dumps(result, ensure_ascii=False))
+                        )
+
+                    db.connection.commit()
+                    logger.info(f"Successfully updated similar results for thread_id: {thread_id}, conversation_id: {conversation_id}")
+                    return {"success": True}
+
+                except Exception as e:
+                    db.connection.rollback()
+                    logger.error(f"Database transaction failed: {str(e)}", exc_info=True)
+                    raise
+
+        except Exception as e:
+            logger.error(f"Failed to update similar results: {str(e)}", exc_info=True)
+            return {"success": False}
+
+    @classmethod
+    def update_recommendations(cls, thread_id: int, conversation_id: int, user_id: int,
+                             recommendations: List[str]) -> Dict[str, bool]:
+        """추천 결과만 업데이트"""
+        try:
+            with Database() as db:
+                db.connection.start_transaction()
+                try:
+                    # 소유권 확인
+                    db.execute(
+                        """SELECT 1 FROM threads t 
+                           JOIN conversations c ON t.id = c.thread_id 
+                           WHERE t.id = %s AND c.conversation_id = %s AND t.user_id = %s""",
+                        (thread_id, conversation_id, user_id)
+                    )
+                    if not db.fetchone():
+                        raise Exception("Invalid thread_id, conversation_id, or unauthorized access")
+
+                    # recommendations만 업데이트
+                    for idx, category in enumerate(['recommended_1', 'recommended_2', 'recommended_3'], 1):
+                        recommendation = recommendations[idx-1] if idx <= len(recommendations) else ""
+                        db.execute(
+                            """INSERT INTO conversation_data 
+                               (thread_id, conversation_id, category, data)
+                               VALUES (%s, %s, %s, %s)
+                               ON DUPLICATE KEY UPDATE data = VALUES(data)""",
+                            (thread_id, conversation_id, category, recommendation)
+                        )
+
+                    db.connection.commit()
+                    logger.info(f"Successfully updated recommendations for thread_id: {thread_id}, conversation_id: {conversation_id}")
+                    return {"success": True}
+
+                except Exception as e:
+                    db.connection.rollback()
+                    logger.error(f"Database transaction failed: {str(e)}", exc_info=True)
+                    raise
+
+        except Exception as e:
+            logger.error(f"Failed to update recommendations: {str(e)}", exc_info=True)
+            return {"success": False}

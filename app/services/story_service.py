@@ -80,14 +80,20 @@ class ThreadManager:
     @staticmethod
     def update_thread_title(thread_id: int, title: str, only_if_new: bool = False) -> bool:
         """thread 제목 업데이트"""
+        logger.info(f"Attempting to update thread title - thread_id: {thread_id}, new_title: {title}, only_if_new: {only_if_new}")
+        
         if only_if_new:
             with Database() as db:
                 db.execute(
-                    """SELECT id FROM threads WHERE id = %s AND title = '새 이야기'""",
+                    """SELECT id, title FROM threads WHERE id = %s AND title = '새 이야기'""",
                     (thread_id,)
                 )
-                if not db.fetchone():
+                result = db.fetchone()
+                if not result:
+                    logger.info(f"Thread {thread_id} title update skipped - not a new thread or title is not '새 이야기'")
                     return False
+                else:
+                    logger.info(f"Thread {thread_id} eligible for title update - current title: '새 이야기'")
 
         with Database() as db:
             try:
@@ -95,6 +101,7 @@ class ThreadManager:
                     """UPDATE threads SET title = %s WHERE id = %s""",
                     (title, thread_id)
                 )
+                logger.info(f"Successfully updated thread {thread_id} title to: {title}")
                 return True
             except Exception as e:
                 logger.error(f"Failed to update thread title: {str(e)}", exc_info=True)
@@ -931,10 +938,20 @@ class StoryService:
                     with Database() as db:
                         db.connection.start_transaction()
                         try:
-                            # 새 thread인 경우에만 제목 업데이트
-                            if existing_db_thread_id is None:
-                                ThreadManager.update_thread_title(thread_id, story_data["title"])
-                            
+                            # conversation_id가 1이고 취소되지 않은 경우에만 title 업데이트
+                            if conversation_id == 1:
+                                if was_cancelled:
+                                    new_title = "새 이야기"
+                                else:
+                                    # created_title이 정상적으로 생성되었는지 확인
+                                    if story_data and "title" in story_data:
+                                        new_title = story_data["title"]
+                                    else:
+                                        new_title = "새 이야기"
+                                    
+                                    logger.info(f"Updating thread title for conversation_id 1 - thread_id: {thread_id}, new_title: {new_title}, was_cancelled: {was_cancelled}")
+                                    ThreadManager.update_thread_title(thread_id, new_title)
+                                
                             # 대화 데이터 저장 (user_input과 tags 제외)
                             data_items = [
                                 ('created_content', story_data["story"]),
